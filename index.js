@@ -1,54 +1,63 @@
 const express = require("express");
-const multer = require("multer");
 const cors = require("cors");
+const multer = require("multer");
 const { PDFDocument } = require("pdf-lib");
-const fs = require("fs");
-const path = require("path");
 
 const app = express();
-app.use(cors());
-const cors = require("cors");
-app.use(cors({
+
+// CORS: add your Vercel URL (and localhost for dev)
+const corsOptions = {
   origin: [
+    "http://localhost:3000",
     "https://pdfremover-frontend.vercel.app"
   ],
   methods: ["POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
-}));
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // handle preflight
 
-const upload = multer({ dest: "uploads/" });
+// Multer in-memory (no temp files on disk)
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Health check
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
 app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
   try {
-    const filePath = req.file.path;
-    const buffer = fs.readFileSync(filePath);
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    // pagesToRemove is a comma-separated string like "1,3,5"
+    const buffer = req.file.buffer;
+
+    // pagesToRemove: "1,3,5"
     const pagesToRemove = (req.body.pagesToRemove || "")
       .split(",")
-      .map(s => s.trim())
+      .map((s) => s.trim())
       .filter(Boolean)
-      .map(n => parseInt(n, 10) - 1); // convert to zero-based
+      .map((n) => parseInt(n, 10) - 1) // zero-based
+      .filter((n) => Number.isInteger(n));
 
     const srcPdf = await PDFDocument.load(buffer);
     const total = srcPdf.getPageCount();
 
-    // Build a list of pages to keep
-    const keepIndices = [];
-    for (let i = 0; i < total; i++) {
-      if (!pagesToRemove.includes(i)) keepIndices.push(i);
+    // basic validation
+    const uniqueRemovals = [...new Set(pagesToRemove)].filter(
+      (i) => i >= 0 && i < total
+    );
+    if (uniqueRemovals.length === total) {
+      return res.status(400).json({ error: "Cannot remove all pages" });
     }
 
-    // Create new PDF and copy kept pages
+    const keepIndices = [];
+    for (let i = 0; i < total; i++) {
+      if (!uniqueRemovals.includes(i)) keepIndices.push(i);
+    }
+
     const outPdf = await PDFDocument.create();
     const copied = await outPdf.copyPages(srcPdf, keepIndices);
-    copied.forEach(p => outPdf.addPage(p));
+    copied.forEach((p) => outPdf.addPage(p));
     const outBytes = await outPdf.save();
 
-    // cleanup temp file
-    fs.unlinkSync(filePath);
-
-    // send as download
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="cleaned.pdf"');
     res.send(Buffer.from(outBytes));
