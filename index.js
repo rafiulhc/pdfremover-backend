@@ -8,6 +8,41 @@ const { spawn } = require("child_process");
 const app = express();
 const { execFile } = require("child_process");
 
+const fs = require("fs");
+const { spawn } = require("child_process");
+
+function resolveSofficeBin() {
+  if (process.env.SOFFICE_BIN) return process.env.SOFFICE_BIN;
+  const candidates = [
+    "/usr/bin/libreoffice",
+    "/usr/bin/soffice",
+    "/usr/lib/libreoffice/program/soffice",
+  ];
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  return "soffice";
+}
+const SOFFICE_CMD = resolveSofficeBin();
+console.log("Resolved soffice path:", SOFFICE_CMD);
+
+function runSoffice(args, { timeoutMs = 120000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(SOFFICE_CMD, args, {
+      env: { ...process.env, HOME: process.env.HOME || "/tmp" },
+    });
+    let stderr = "", stdout = "";
+    const to = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} ; reject(new Error(`LibreOffice timeout after ${timeoutMs}ms`)); }, timeoutMs);
+    child.stdout.on("data", d => (stdout += d.toString()));
+    child.stderr.on("data", d => (stderr += d.toString()));
+    child.on("error", err => { clearTimeout(to); reject(new Error(`Failed to start soffice (${SOFFICE_CMD}): ${err.message}`)); });
+    child.on("close", code => {
+      clearTimeout(to);
+      if (code === 0) return resolve({ stdout, stderr });
+      reject(new Error(`soffice exited with code ${code}\n${stderr || stdout}`));
+    });
+  });
+}
 
 
 app.use(cors({
@@ -91,44 +126,7 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
   }
 });
 
-function resolveSofficeBin() {
-    if (process.env.SOFFICE_BIN) return process.env.SOFFICE_BIN;
 
-    // Common Debian/Ubuntu locations when installed via apt
-    const candidates = [
-      "/usr/bin/libreoffice",                         // wrapper
-      "/usr/bin/soffice",                             // symlink or wrapper
-      "/usr/lib/libreoffice/program/soffice",         // actual binary
-      "/app/.apt/usr/bin/soffice",                    // if using apt buildpack
-      "/app/.apt/usr/lib/libreoffice/program/soffice" // if using apt buildpack
-    ];
-    for (const c of candidates) {
-      try { if (fs.existsSync(c)) return c; } catch {}
-    }
-    return "soffice"; // last resort (PATH)
-  }
-
-  const SOFFICE_CMD = resolveSofficeBin();
-  console.log("Resolved soffice path:", SOFFICE_CMD);
-
-  function runSoffice(args, { timeoutMs = 120000 } = {}) {
-    return new Promise((resolve, reject) => {
-      const cmd = resolveSofficeBin();
-      const child = spawn(cmd, args, {
-        env: { ...process.env, HOME: process.env.HOME || "/tmp" },
-      });
-      let stderr = "", stdout = "";
-      const to = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} ; reject(new Error(`LibreOffice timeout after ${timeoutMs}ms`)); }, timeoutMs);
-      child.stdout.on("data", d => (stdout += d.toString()));
-      child.stderr.on("data", d => (stderr += d.toString()));
-      child.on("error", err => { clearTimeout(to); reject(new Error(`Failed to start soffice (${cmd}): ${err.message}`)); });
-      child.on("close", code => {
-        clearTimeout(to);
-        if (code === 0) return resolve({ stdout, stderr });
-        reject(new Error(`soffice exited with code ${code}\n${stderr || stdout}`));
-      });
-    });
-  }
   /**
    * DOCX -> PDF via LibreOffice
    */
