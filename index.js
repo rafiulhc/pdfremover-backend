@@ -11,7 +11,8 @@ app.use(cors({
   origin: [
     "http://localhost:3000",
     "https://pdfremover-frontend.vercel.app",
-    "https://pdfmergersplitter.app/"
+    "https://pdfmergersplitter.app",
+    "https://www.pdfmergersplitter.app"
   ],
   methods: ["POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
