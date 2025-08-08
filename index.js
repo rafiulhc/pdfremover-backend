@@ -4,11 +4,11 @@ const cors = require("cors");
 const { PDFDocument } = require("pdf-lib");
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
+const axios = require("axios");
+const CloudConvert = require("cloudconvert");
+const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY);
 const app = express();
-const { execFile } = require("child_process");
-
-
+require('dotenv').config();
 
 app.use(cors({
   origin: [
@@ -91,119 +91,124 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
   }
 });
 
-function runSoffice(args, { timeoutMs = 120000 } = {}) {
-    return new Promise((resolve, reject) => {
-      const sofficeCmd = process.env.SOFFICE_BIN || "soffice";
-      const child = spawn(sofficeCmd, args, {
-        env: {
-          ...process.env,
-          // Use a writable profile dir (avoids profile locking issues on Heroku)
-          HOME: process.env.HOME || "/tmp",
-        },
-      });
-
-      let stderr = "";
-      let stdout = "";
-
-      const to = setTimeout(() => {
-        try { child.kill("SIGKILL"); } catch {}
-        reject(new Error(`LibreOffice timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-
-      child.stdout.on("data", (d) => (stdout += d.toString()));
-      child.stderr.on("data", (d) => (stderr += d.toString()));
-
-      child.on("error", (err) => {
-        clearTimeout(to);
-        reject(new Error(`Failed to start soffice: ${err.message}`));
-      });
-
-      child.on("close", (code) => {
-        clearTimeout(to);
-        if (code === 0) return resolve({ stdout, stderr });
-        reject(new Error(`soffice exited with code ${code}\n${stderr || stdout}`));
-      });
-    });
+// Util: find task by name
+function byName(tasks, name) {
+    return tasks.find((t) => t.name === name);
   }
-  /**
-   * DOCX -> PDF via LibreOffice
-   */
-  app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
-    const tmpPath = req.file?.path;
-    if (!tmpPath) return res.status(400).json({ error: "No file uploaded" });
 
-    const origName = req.file.originalname || "input.docx";
-    const baseNoExt = path.parse(origName).name;
-    const outDir = path.join(process.cwd(), "uploads");
+  // Util: throw with CloudConvert task error details
+  function assertFinished(task, label) {
+    if (!task) throw new Error(`${label} task missing`);
+    if (task.status !== "finished") {
+      const msg = task?.message || task?.error || JSON.stringify(task, null, 2);
+      throw new Error(`${label} task not finished: ${msg}`);
+    }
+  }
+
+  async function runCloudConvert({ filePath, inputFormat, outputFormat, useOffice = true }) {
+    // 1) Create a job with import -> convert -> export
+    const job = await cloudConvert.jobs.create({
+      tasks: {
+        "import-1": { operation: "import/upload" },
+        "convert-1": {
+          operation: "convert",
+          input: "import-1",
+          input_format: inputFormat,     // e.g. "pdf" or "docx"
+          output_format: outputFormat,   // e.g. "docx" or "pdf"
+          ...(useOffice ? { engine: "office" } : {}), // **important for fidelity**
+        },
+        "export-1": { operation: "export/url", input: "convert-1" },
+      },
+    });
+
+    // 2) Upload your local file to import-1
+    const importTask = byName(job.tasks, "import-1");
+    await cloudConvert.tasks.upload(importTask, fs.createReadStream(filePath), {
+      filename: filePath.split("/").pop(),
+    });
+
+    // 3) Wait for job to complete
+    const finishedJob = await cloudConvert.jobs.wait(job.id);
+
+    // 4) Inspect tasks for better errors
+    const importDone = byName(finishedJob.tasks, "import-1");
+    const convertDone = byName(finishedJob.tasks, "convert-1");
+    const exportDone  = byName(finishedJob.tasks, "export-1");
+
+    // If convert task errored, surface its message
+    if (convertDone?.status === "error") {
+      const msg = convertDone?.message || convertDone?.error || "Unknown convert error";
+      throw new Error(`Convert failed: ${msg}`);
+    }
+
+    // Guard all finished statuses
+    assertFinished(importDone, "Import");
+    assertFinished(convertDone, "Convert");
+    assertFinished(exportDone, "Export");
+
+    if (!exportDone.result?.files?.length) {
+      throw new Error("Export produced no files");
+    }
+
+    // 5) Download final file
+    const fileUrl = exportDone.result.files[0].url;
+    const resp = await axios.get(fileUrl, { responseType: "arraybuffer" });
+    return Buffer.from(resp.data);
+  }
+
+
+
+  // PDF -> DOCX
+  app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => {
+    const tmp = req.file?.path;
+    if (!tmp) return res.status(400).json({ error: "No file uploaded" });
 
     try {
-      await runSoffice([
-        "--headless","--nologo","-env:UserInstallation=file:///tmp/lo_profile",
-        "--convert-to","pdf","--outdir", outDir, tmpPath
-      ]);
+      const out = await runCloudConvert({
+        filePath: tmp,
+        inputFormat: "pdf",
+        outputFormat: "docx",
+        useOffice: true,
+      });
 
-      const outFile = findConverted(outDir, baseNoExt, "pdf") || findConverted(outDir, path.parse(tmpPath).name, "pdf");
-      if (!outFile || !fs.existsSync(outFile)) throw new Error("Conversion output not found");
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      );
+      res.setHeader("Content-Disposition", 'attachment; filename="converted.docx"');
+      res.send(out);
+    } catch (e) {
+      console.error("pdf-to-docx error:", e?.message || e);
+      // Bubble a helpful message to the client
+      res.status(500).json({ error: e?.message || "Conversion failed" });
+    } finally {
+      fs.unlink(tmp, () => {});
+    }
+  });
+
+  // DOCX -> PDF
+  app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
+    const tmp = req.file?.path;
+    if (!tmp) return res.status(400).json({ error: "No file uploaded" });
+
+    try {
+      const out = await runCloudConvert({
+        filePath: tmp,
+        inputFormat: "docx",
+        outputFormat: "pdf",
+        useOffice: true,
+      });
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", 'attachment; filename="converted.pdf"');
-      res.send(fs.readFileSync(outFile));
+      res.send(out);
     } catch (e) {
-      console.error("docx->pdf error:", e.message);
-      res.status(500).json({ error: e.message.includes("soffice") ? "Converter not available on server" : `Conversion failed: ${e.message}` });
+      console.error("docx-to-pdf error:", e?.message || e);
+      res.status(500).json({ error: e?.message || "Conversion failed" });
     } finally {
-      try { fs.unlinkSync(tmpPath); } catch {}
-      try {
-        const outFile = findConverted(outDir, baseNoExt, "pdf") || findConverted(outDir, path.parse(tmpPath).name, "pdf");
-        if (outFile) fs.unlinkSync(outFile);
-      } catch {}
+      fs.unlink(tmp, () => {});
     }
   });
-
-  /**
-   * PDF -> DOCX via LibreOffice
-   * NOTE: quality varies depending on the PDF (vector text vs scanned/complex layout).
-   */
-  app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-    const tmpPath = req.file.path;                 // e.g. uploads/xyz789
-    const origName = req.file.originalname || "input.pdf";
-    const baseNoExt = path.parse(origName).name;
-    const outDir = path.join(process.cwd(), "uploads");
-
-    try {
-      await runSoffice(["--headless", "--nologo", "--convert-to", "docx", "--outdir", outDir, tmpPath]);
-
-      const outFile = findConverted(outDir, baseNoExt, "docx") || findConverted(outDir, path.parse(tmpPath).name, "docx");
-      if (!outFile || !fs.existsSync(outFile)) throw new Error("Conversion output not found");
-
-      const bytes = fs.readFileSync(outFile);
-      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-      res.setHeader("Content-Disposition", 'attachment; filename="converted.docx"');
-      res.send(bytes);
-    } catch (e) {
-      console.error("pdf->docx error:", e.message);
-      res.status(500).json({ error: "Conversion failed: " + e.message });
-    } finally {
-      fs.unlink(tmpPath, () => {});
-      try {
-        const outFile = findConverted(outDir, baseNoExt, "docx") || findConverted(outDir, path.parse(tmpPath).name, "docx");
-        if (outFile) fs.unlink(outFile, () => {});
-      } catch {}
-    }
-  });
-
-  app.get("/api/debug/soffice", (_req, res) => {
-  execFile("which", ["soffice"], (err, stdout, stderr) => {
-    res.json({
-      which: stdout.trim() || null,
-      err: err ? err.message : null,
-      stderr: (stderr || "").toString(),
-      envHOME: process.env.HOME || null,
-    });
-  });
-});
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Backend running on :${PORT}`));
