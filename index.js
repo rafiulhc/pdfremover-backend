@@ -7,8 +7,6 @@ const path = require("path");
 const { spawn } = require("child_process");
 const app = express();
 const { execFile } = require("child_process");
-
-const fs = require("fs");
 const { spawn } = require("child_process");
 
 function resolveSofficeBin() {
