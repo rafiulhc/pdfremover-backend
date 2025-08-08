@@ -67,5 +67,38 @@ app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
   }
 });
 
+// Add this in your existing backend file (e.g., server.js)
+
+const mergeUpload = multer({ dest: "uploads/" }).array("files", 10); // allow up to 10 PDFs
+
+app.post("/api/merge-pdfs", mergeUpload, async (req, res) => {
+  try {
+    const outPdf = await PDFDocument.create();
+
+    for (const file of req.files) {
+      const buffer = fs.readFileSync(file.path);
+      const srcPdf = await PDFDocument.load(buffer);
+
+      const copiedPages = await outPdf.copyPages(
+        srcPdf,
+        srcPdf.getPageIndices()
+      );
+
+      copiedPages.forEach(p => outPdf.addPage(p));
+      fs.unlinkSync(file.path); // cleanup temp file
+    }
+
+    const outBytes = await outPdf.save();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="merged.pdf"');
+    res.send(Buffer.from(outBytes));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to merge PDFs." });
+  }
+});
+
+
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Backend running on :${PORT}`));
