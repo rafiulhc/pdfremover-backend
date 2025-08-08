@@ -6,7 +6,7 @@ const { PDFDocument } = require("pdf-lib");
 const fs = require("fs");
 const path = require("path");
 const { spawn, execFile } = require("child_process");
-
+const sharp = require("sharp");
 const app = express();
 
 /* ---------- basics ---------- */
@@ -241,6 +241,150 @@ app.get("/api/debug/soffice", (_req, res) => {
     PATH: process.env.PATH
   });
 });
+
+function runGhostscript(inputPath, outputPath, opts = {}) {
+    return new Promise((resolve, reject) => {
+      const {
+        pdfsettings = "/ebook", // /screen (smallest), /ebook, /printer, /prepress
+        colorRes = 120,         // dpi downsample target
+        grayRes = 120,
+        monoRes = 120
+      } = opts;
+
+      // Common GS flags for size reduction
+      const args = [
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        `-dPDFSETTINGS=${pdfsettings}`,
+        "-dNOPAUSE", "-dQUIET", "-dBATCH",
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dSubsetFonts=true",
+
+        "-dDownsampleColorImages=true",
+        `-dColorImageResolution=${colorRes}`,
+
+        "-dDownsampleGrayImages=true",
+        `-dGrayImageResolution=${grayRes}`,
+
+        "-dDownsampleMonoImages=true",
+        `-dMonoImageResolution=${monoRes}`,
+
+        `-sOutputFile=${outputPath}`,
+        inputPath
+      ];
+
+      const child = spawn("gs", args);
+      let stderr = "";
+      child.stderr.on("data", d => (stderr += d.toString()));
+      child.on("error", err => reject(err));
+      child.on("close", code => {
+        if (code === 0) return resolve();
+        reject(new Error(`Ghostscript exited ${code}: ${stderr}`));
+      });
+    });
+  }
+
+  /**
+   * POST /api/compress/image
+   * Form: file (image), targetKb? (default 500)
+   * Output: webp (image/webp)
+   */
+  app.post("/api/compress/image", upload.single("file"), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10)); // safety floor 50KB
+
+    const inPath = req.file.path;
+    const tmpOut = path.join(OUTDIR, `${path.parse(inPath).name}.webp`);
+
+    try {
+      // Read input & probe dimensions
+      const input = fs.readFileSync(inPath);
+      const meta = await sharp(input).metadata();
+      let { width } = meta;
+
+      // Start fairly high quality, then step down
+      let quality = 82; // webp quality
+      let attempt = 0;
+      let outBuf = null;
+
+      while (attempt < 8) {
+        // If still too big after quality steps, reduce width by ~15% each loop (but not below 600)
+        const candidateWidth =
+          attempt < 4 ? width : Math.max(600, Math.floor((width || 2000) * Math.pow(0.85, attempt - 3)));
+
+        outBuf = await sharp(input)
+          .resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true })
+          .webp({ quality, effort: 4 })
+          .toBuffer();
+
+        if (outBuf.length <= targetKb * 1024) break;
+
+        // drop quality; then resolution if needed
+        quality = Math.max(45, quality - 8);
+        attempt++;
+      }
+
+      if (!outBuf) throw new Error("Compression failed");
+
+      res.setHeader("Content-Type", "image/webp");
+      res.setHeader("Content-Disposition", 'attachment; filename="compressed.webp"');
+      res.send(outBuf);
+    } catch (e) {
+      console.error("image compress error:", e);
+      res.status(500).json({ error: "Failed to compress image" });
+    } finally {
+      try { fs.unlinkSync(inPath); } catch {}
+      try { fs.unlinkSync(tmpOut); } catch {}
+    }
+  });
+
+  /**
+   * POST /api/compress/pdf
+   * Form: file (pdf), targetKb? (default 500)
+   * Output: application/pdf
+   */
+  app.post("/api/compress/pdf", upload.single("file"), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const targetKb = Math.max(100, parseInt(req.body.targetKb || "500", 10)); // floor 100KB for legibility
+
+    const inPath = req.file.path;
+    const base = path.parse(inPath).name;
+    const outPath = path.join(OUTDIR, `${base}-compressed.pdf`);
+
+    try {
+      // Iteratively try tighter presets/resolutions
+      const tries = [
+        { pdfsettings: "/ebook", colorRes: 144, grayRes: 144, monoRes: 144 },
+        { pdfsettings: "/screen", colorRes: 120, grayRes: 120, monoRes: 120 },
+        { pdfsettings: "/screen", colorRes: 96, grayRes: 96, monoRes: 96 }
+      ];
+
+      let ok = false;
+      for (const t of tries) {
+        await runGhostscript(inPath, outPath, t);
+        const size = fs.existsSync(outPath) ? fs.statSync(outPath).size : Infinity;
+        if (size <= targetKb * 1024) { ok = true; break; }
+
+        // If still too large, feed the output back in for another pass
+        fs.copyFileSync(outPath, inPath);
+      }
+
+      if (!fs.existsSync(outPath)) throw new Error("No output file");
+      const buf = fs.readFileSync(outPath);
+
+      // We return the best effort even if slightly above target
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", 'attachment; filename="compressed.pdf"');
+      res.send(buf);
+    } catch (e) {
+      console.error("pdf compress error:", e);
+      res.status(500).json({ error: "Failed to compress PDF" });
+    } finally {
+      try { fs.unlinkSync(inPath); } catch {}
+      try { fs.unlinkSync(outPath); } catch {}
+    }
+  });
 
 /* ---------- start ---------- */
 const PORT = process.env.PORT || 4000;
