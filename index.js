@@ -10,7 +10,8 @@ const app = express();
 app.use(cors({
   origin: [
     "http://localhost:3000",
-    "https://pdfremover-frontend.vercel.app" // your frontend
+    "https://pdfremover-frontend.vercel.app",
+    "https://pdfmergersplitter.app/"
   ],
   methods: ["POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
