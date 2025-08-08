@@ -6,6 +6,9 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const app = express();
+const { execFile } = require("child_process");
+
+
 
 app.use(cors({
   origin: [
@@ -190,6 +193,17 @@ function runSoffice(args, { timeoutMs = 120000 } = {}) {
       } catch {}
     }
   });
+
+  app.get("/api/debug/soffice", (_req, res) => {
+  execFile("which", ["soffice"], (err, stdout, stderr) => {
+    res.json({
+      which: stdout.trim() || null,
+      err: err ? err.message : null,
+      stderr: (stderr || "").toString(),
+      envHOME: process.env.HOME || null,
+    });
+  });
+});
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Backend running on :${PORT}`));
