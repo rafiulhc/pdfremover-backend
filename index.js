@@ -9,6 +9,7 @@ const app = express();
 
 app.use(cors({
   origin: [
+    "http://localhost:3000",
     "https://pdfremover-frontend.vercel.app" // your frontend
   ],
   methods: ["POST", "OPTIONS"],
