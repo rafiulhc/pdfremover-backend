@@ -15,7 +15,7 @@ const corsOptions = {
   allowedHeaders: ["Content-Type"]
 };
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // handle preflight
+
 
 // Multer in-memory (no temp files on disk)
 const upload = multer({ storage: multer.memoryStorage() });
