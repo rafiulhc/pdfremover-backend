@@ -4,7 +4,7 @@ const cors = require("cors");
 const { PDFDocument } = require("pdf-lib");
 const fs = require("fs");
 const path = require("path");
-
+const { spawn } = require("child_process");
 const app = express();
 
 app.use(cors({
@@ -88,63 +88,71 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
   }
 });
 
-function runSoffice(args) {
+function runSoffice(args, { timeoutMs = 120000 } = {}) {
     return new Promise((resolve, reject) => {
-      execFile("soffice", args, { timeout: 120000 }, (err, stdout, stderr) => {
-        if (err) return reject(new Error(stderr || stdout || err.message));
-        resolve({ stdout, stderr });
+      const sofficeCmd = process.env.SOFFICE_BIN || "soffice";
+      const child = spawn(sofficeCmd, args, {
+        env: {
+          ...process.env,
+          // Use a writable profile dir (avoids profile locking issues on Heroku)
+          HOME: process.env.HOME || "/tmp",
+        },
+      });
+
+      let stderr = "";
+      let stdout = "";
+
+      const to = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch {}
+        reject(new Error(`LibreOffice timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      child.stdout.on("data", (d) => (stdout += d.toString()));
+      child.stderr.on("data", (d) => (stderr += d.toString()));
+
+      child.on("error", (err) => {
+        clearTimeout(to);
+        reject(new Error(`Failed to start soffice: ${err.message}`));
+      });
+
+      child.on("close", (code) => {
+        clearTimeout(to);
+        if (code === 0) return resolve({ stdout, stderr });
+        reject(new Error(`soffice exited with code ${code}\n${stderr || stdout}`));
       });
     });
   }
-
-  // Find the newest file in a directory that matches a base name (Heroku temp)
-  function findConverted(outDir, baseNoExt, targetExt) {
-    const files = fs.readdirSync(outDir)
-      .filter(f => f.toLowerCase().endsWith(`.${targetExt}`) && f.startsWith(baseNoExt));
-    if (!files.length) return null;
-    // pick the newest by mtime
-    let newest = files[0];
-    let newestTime = fs.statSync(path.join(outDir, newest)).mtimeMs;
-    for (const f of files) {
-      const t = fs.statSync(path.join(outDir, f)).mtimeMs;
-      if (t > newestTime) { newest = f; newestTime = t; }
-    }
-    return path.join(outDir, newest);
-  }
-
   /**
    * DOCX -> PDF via LibreOffice
    */
   app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const tmpPath = req.file?.path;
+    if (!tmpPath) return res.status(400).json({ error: "No file uploaded" });
 
-    const tmpPath = req.file.path;                 // e.g. uploads/abc123
     const origName = req.file.originalname || "input.docx";
     const baseNoExt = path.parse(origName).name;
-    const outDir = path.join(process.cwd(), "uploads"); // write output next to input
+    const outDir = path.join(process.cwd(), "uploads");
 
     try {
-      // Convert with LibreOffice
-      // --headless: no UI; --nologo: faster; --convert-to pdf
-      await runSoffice(["--headless", "--nologo", "--convert-to", "pdf", "--outdir", outDir, tmpPath]);
+      await runSoffice([
+        "--headless","--nologo","-env:UserInstallation=file:///tmp/lo_profile",
+        "--convert-to","pdf","--outdir", outDir, tmpPath
+      ]);
 
       const outFile = findConverted(outDir, baseNoExt, "pdf") || findConverted(outDir, path.parse(tmpPath).name, "pdf");
       if (!outFile || !fs.existsSync(outFile)) throw new Error("Conversion output not found");
 
-      const bytes = fs.readFileSync(outFile);
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", 'attachment; filename="converted.pdf"');
-      res.send(bytes);
+      res.send(fs.readFileSync(outFile));
     } catch (e) {
       console.error("docx->pdf error:", e.message);
-      res.status(500).json({ error: "Conversion failed: " + e.message });
+      res.status(500).json({ error: e.message.includes("soffice") ? "Converter not available on server" : `Conversion failed: ${e.message}` });
     } finally {
-      // cleanup
-      fs.unlink(tmpPath, () => {});
-      // optional: delete output file to keep slug clean
+      try { fs.unlinkSync(tmpPath); } catch {}
       try {
         const outFile = findConverted(outDir, baseNoExt, "pdf") || findConverted(outDir, path.parse(tmpPath).name, "pdf");
-        if (outFile) fs.unlink(outFile, () => {});
+        if (outFile) fs.unlinkSync(outFile);
       } catch {}
     }
   });
