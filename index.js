@@ -7,6 +7,15 @@ const path = require("path");
 
 const app = express();
 app.use(cors());
+const cors = require("cors");
+app.use(cors({
+  origin: [
+    "https://pdfremover-frontend.vercel.app"
+  ],
+  methods: ["POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
+}));
+
 const upload = multer({ dest: "uploads/" });
 
 app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
