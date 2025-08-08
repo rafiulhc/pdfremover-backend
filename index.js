@@ -91,84 +91,122 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
   }
 });
 
-async function runCloudConvert(filePath, outputFormat, inputFormat) {
-    // 1) Create job with tasks
+// Util: find task by name
+function byName(tasks, name) {
+    return tasks.find((t) => t.name === name);
+  }
+
+  // Util: throw with CloudConvert task error details
+  function assertFinished(task, label) {
+    if (!task) throw new Error(`${label} task missing`);
+    if (task.status !== "finished") {
+      const msg = task?.message || task?.error || JSON.stringify(task, null, 2);
+      throw new Error(`${label} task not finished: ${msg}`);
+    }
+  }
+
+  async function runCloudConvert({ filePath, inputFormat, outputFormat, useOffice = true }) {
+    // 1) Create a job with import -> convert -> export
     const job = await cloudConvert.jobs.create({
       tasks: {
         "import-1": { operation: "import/upload" },
         "convert-1": {
           operation: "convert",
           input: "import-1",
-          output_format: outputFormat, // "docx" or "pdf"
-          // optional tune for better doc fidelity:
-          // e.g. for pdf->docx, engine: "office"
+          input_format: inputFormat,     // e.g. "pdf" or "docx"
+          output_format: outputFormat,   // e.g. "docx" or "pdf"
+          ...(useOffice ? { engine: "office" } : {}), // **important for fidelity**
         },
-        "export-1": { operation: "export/url", input: "convert-1" }
-      }
+        "export-1": { operation: "export/url", input: "convert-1" },
+      },
     });
 
-    const uploadTask = job.tasks.find(t => t.name === "import-1");
-    // 2) Upload local file to CloudConvert
-    await cloudConvert.tasks.upload(uploadTask, fs.createReadStream(filePath));
+    // 2) Upload your local file to import-1
+    const importTask = byName(job.tasks, "import-1");
+    await cloudConvert.tasks.upload(importTask, fs.createReadStream(filePath), {
+      filename: filePath.split("/").pop(),
+    });
 
-    // 3) Wait for conversion to finish
-    const finished = await cloudConvert.jobs.wait(job.id);
-    const exportTask = finished.tasks.find(t => t.name === "export-1" && t.status === "finished");
-    if (!exportTask || !exportTask.result || !exportTask.result.files || !exportTask.result.files.length) {
-      throw new Error("Export task failed");
+    // 3) Wait for job to complete
+    const finishedJob = await cloudConvert.jobs.wait(job.id);
+
+    // 4) Inspect tasks for better errors
+    const importDone = byName(finishedJob.tasks, "import-1");
+    const convertDone = byName(finishedJob.tasks, "convert-1");
+    const exportDone  = byName(finishedJob.tasks, "export-1");
+
+    // If convert task errored, surface its message
+    if (convertDone?.status === "error") {
+      const msg = convertDone?.message || convertDone?.error || "Unknown convert error";
+      throw new Error(`Convert failed: ${msg}`);
     }
 
-    // 4) Get file URL
-    const fileUrl = exportTask.result.files[0].url;
+    // Guard all finished statuses
+    assertFinished(importDone, "Import");
+    assertFinished(convertDone, "Convert");
+    assertFinished(exportDone, "Export");
 
-    // 5) Download bytes
+    if (!exportDone.result?.files?.length) {
+      throw new Error("Export produced no files");
+    }
+
+    // 5) Download final file
+    const fileUrl = exportDone.result.files[0].url;
     const resp = await axios.get(fileUrl, { responseType: "arraybuffer" });
     return Buffer.from(resp.data);
   }
 
-  // ---------- PDF -> DOCX ----------
+
+
+  // PDF -> DOCX
   app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => {
+    const tmp = req.file?.path;
+    if (!tmp) return res.status(400).json({ error: "No file uploaded" });
+
     try {
-      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-      const filePath = req.file.path;
+      const out = await runCloudConvert({
+        filePath: tmp,
+        inputFormat: "pdf",
+        outputFormat: "docx",
+        useOffice: true,
+      });
 
-      // optional: validate mime
-      // if (req.file.mimetype !== "application/pdf") ...
-
-      const outBytes = await runCloudConvert(filePath, "docx", "pdf");
-
-      // cleanup
-      fs.unlink(req.file.path, () => {});
-
-      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      );
       res.setHeader("Content-Disposition", 'attachment; filename="converted.docx"');
-      res.send(outBytes);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Conversion failed" });
+      res.send(out);
+    } catch (e) {
+      console.error("pdf-to-docx error:", e?.message || e);
+      // Bubble a helpful message to the client
+      res.status(500).json({ error: e?.message || "Conversion failed" });
+    } finally {
+      fs.unlink(tmp, () => {});
     }
   });
 
-  // ---------- DOCX -> PDF ----------
+  // DOCX -> PDF
   app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
+    const tmp = req.file?.path;
+    if (!tmp) return res.status(400).json({ error: "No file uploaded" });
+
     try {
-      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-      const filePath = req.file.path;
-
-      // optional: validate .docx
-      // if (!req.file.originalname.toLowerCase().endsWith(".docx")) ...
-
-      const outBytes = await runCloudConvert(filePath, "pdf", "docx");
-
-      // cleanup
-      fs.unlink(req.file.path, () => {});
+      const out = await runCloudConvert({
+        filePath: tmp,
+        inputFormat: "docx",
+        outputFormat: "pdf",
+        useOffice: true,
+      });
 
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", 'attachment; filename="converted.pdf"');
-      res.send(outBytes);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Conversion failed" });
+      res.send(out);
+    } catch (e) {
+      console.error("docx-to-pdf error:", e?.message || e);
+      res.status(500).json({ error: e?.message || "Conversion failed" });
+    } finally {
+      fs.unlink(tmp, () => {});
     }
   });
 
