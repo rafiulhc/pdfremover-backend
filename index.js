@@ -92,18 +92,24 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
 });
 
 function resolveSofficeBin() {
-    if (process.env.SOFFICE_BIN) return process.env.SOFFICE_BIN; // allow override
+    if (process.env.SOFFICE_BIN) return process.env.SOFFICE_BIN;
+
+    // Common Debian/Ubuntu locations when installed via apt
     const candidates = [
-      "/usr/bin/soffice",                              // Docker
-      "/app/.apt/usr/bin/soffice",                     // apt buildpack (if you ever switch back)
-      "/app/.apt/usr/lib/libreoffice/program/soffice",
-      "soffice",
+      "/usr/bin/libreoffice",                         // wrapper
+      "/usr/bin/soffice",                             // symlink or wrapper
+      "/usr/lib/libreoffice/program/soffice",         // actual binary
+      "/app/.apt/usr/bin/soffice",                    // if using apt buildpack
+      "/app/.apt/usr/lib/libreoffice/program/soffice" // if using apt buildpack
     ];
     for (const c of candidates) {
       try { if (fs.existsSync(c)) return c; } catch {}
     }
-    return "soffice";
+    return "soffice"; // last resort (PATH)
   }
+
+  const SOFFICE_CMD = resolveSofficeBin();
+  console.log("Resolved soffice path:", SOFFICE_CMD);
 
   function runSoffice(args, { timeoutMs = 120000 } = {}) {
     return new Promise((resolve, reject) => {
@@ -202,6 +208,20 @@ function resolveSofficeBin() {
     });
   });
 });
+
+app.get("/api/debug/soffice", (_req, res) => {
+    const ls = p => (fs.existsSync(p) ? fs.readdirSync(p) : []);
+    res.json({
+      resolved: SOFFICE_CMD,
+      exists: fs.existsSync(SOFFICE_CMD),
+      candidates: {
+        "/usr/bin": ls("/usr/bin"),
+        "/usr/lib/libreoffice/program": ls("/usr/lib/libreoffice/program"),
+      },
+      PATH: process.env.PATH
+    });
+  });
+
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Backend running on :${PORT}`));
