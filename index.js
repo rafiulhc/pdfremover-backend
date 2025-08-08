@@ -290,54 +290,71 @@ function runGhostscript(inputPath, outputPath, opts = {}) {
    * Form: file (image), targetKb? (default 500)
    * Output: webp (image/webp)
    */
-  app.post("/api/compress/image", upload.single("file"), async (req, res) => {
+  // POST /api/compress/image
+// form-data: file, targetKb (optional), format (optional: webp|jpeg|png)
+app.post("/api/compress/image", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10)); // safety floor 50KB
+
+    const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10));
+    let format = String((req.body.format || "webp")).toLowerCase();
+    if (format === "jpg") format = "jpeg";
+    if (!["webp", "jpeg", "png"].includes(format)) format = "webp";
 
     const inPath = req.file.path;
-    const tmpOut = path.join(OUTDIR, `${path.parse(inPath).name}.webp`);
-
     try {
-      // Read input & probe dimensions
       const input = fs.readFileSync(inPath);
       const meta = await sharp(input).metadata();
-      let { width } = meta;
+      let width = meta.width || 2000;
 
-      // Start fairly high quality, then step down
-      let quality = 82; // webp quality
+      let quality = 82;             // used for webp/jpeg
       let attempt = 0;
       let outBuf = null;
 
-      while (attempt < 8) {
-        // If still too big after quality steps, reduce width by ~15% each loop (but not below 600)
+      while (attempt < 10) {
         const candidateWidth =
-          attempt < 4 ? width : Math.max(600, Math.floor((width || 2000) * Math.pow(0.85, attempt - 3)));
+          attempt < 4 ? width : Math.max(600, Math.floor(width * Math.pow(0.85, attempt - 3)));
 
-        outBuf = await sharp(input)
-          .resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true })
-          .webp({ quality, effort: 4 })
-          .toBuffer();
+        let pipeline = sharp(input).resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true });
+
+        if (format === "webp") {
+          pipeline = pipeline.webp({ quality, effort: 4 });
+        } else if (format === "jpeg") {
+          // JPEG can’t do transparency — flatten to white so you don’t get black boxes
+          pipeline = pipeline.flatten({ background: "#ffffff" }).jpeg({ quality, mozjpeg: true });
+        } else if (format === "png") {
+          // PNG doesn’t have “quality”; use palette + max compression (size driven by dimensions)
+          pipeline = pipeline.png({ compressionLevel: 9, palette: true });
+        }
+
+        outBuf = await pipeline.toBuffer();
 
         if (outBuf.length <= targetKb * 1024) break;
 
-        // drop quality; then resolution if needed
-        quality = Math.max(45, quality - 8);
+        // If too big: drop quality for webp/jpeg, else keep reducing width
+        if (format === "webp" || format === "jpeg") {
+          quality = Math.max(45, quality - 8);
+        }
         attempt++;
       }
 
-      if (!outBuf) throw new Error("Compression failed");
+      const ct =
+        format === "webp" ? "image/webp" :
+        format === "jpeg" ? "image/jpeg" : "image/png";
+      const ext =
+        format === "webp" ? "webp" :
+        format === "jpeg" ? "jpg" : "png";
 
-      res.setHeader("Content-Type", "image/webp");
-      res.setHeader("Content-Disposition", 'attachment; filename="compressed.webp"');
+      res.setHeader("Content-Type", ct);
+      res.setHeader("Content-Disposition", `attachment; filename="compressed.${ext}"`);
       res.send(outBuf);
     } catch (e) {
       console.error("image compress error:", e);
       res.status(500).json({ error: "Failed to compress image" });
     } finally {
       try { fs.unlinkSync(inPath); } catch {}
-      try { fs.unlinkSync(tmpOut); } catch {}
     }
   });
+
 
   /**
    * POST /api/compress/pdf
