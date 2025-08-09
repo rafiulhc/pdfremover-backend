@@ -561,8 +561,11 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
       }
     })();
 
-    const buyUrl =
-      `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&fields[ticket]=${encodeURIComponent(ticket)}`;
+    const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}`;
+
+
+    // const buyUrl =
+    //   `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&fields[ticket]=${encodeURIComponent(ticket)}`;
 
     console.log("PRO PREPARE RESP:", { ticket, buyUrl });
     return res.json({ ticket, buyUrl });
@@ -661,62 +664,73 @@ app.get("/api/pro/download", async (req, res) => {
   }
 });
 
-// Gumroad Ping webhook (mark ticket as paid) — PPP-friendly
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 app.post("/api/gumroad/ping", (req, res) => {
   try {
-    const {
-      product_permalink,
-      price,          // cents as string (e.g. "99")
-      refunded,
-      url_params
-    } = req.body;
+    const { product_permalink, price, refunded, url_params, custom_fields } = req.body;
 
-    // Make sure ping is for the correct product
+    // product slug check
     const slug = (product_permalink || "").split("/").pop();
     if (slug !== GUMROAD_PRODUCT_PERMALINK) {
       console.log("PING: wrong product", { slug, expected: GUMROAD_PRODUCT_PERMALINK });
       return res.status(400).send("Wrong product");
     }
 
-    // === PPP-friendly: accept ANY positive payment ===
+    // PPP-friendly: accept any positive payment
     const cents = parseInt(price || "0", 10);
     if (!Number.isFinite(cents) || cents < 1) {
       console.log("PING: no/zero price", { cents });
       return res.status(400).send("No payment amount");
     }
 
-    // Ignore refunds
+    // ignore refunds
     if (String(refunded || "").toLowerCase() === "true") {
       console.log("PING: refunded");
       return res.status(200).send("Ignored (refunded)");
     }
 
-    // Pull ticket from url_params (can be JSON or object)
-    let params = {};
-    if (typeof url_params === "string") {
-      try { params = JSON.parse(url_params); } catch { params = {}; }
-    } else if (url_params && typeof url_params === "object") {
-      params = url_params;
+    // --- find ticket in multiple possible places ---
+    let ticket = undefined;
+
+    // 1) url_params.ticket (works when you use ?ticket=... in the checkout URL)
+    if (!ticket && url_params) {
+      if (typeof url_params === "string") {
+        try { ticket = JSON.parse(url_params).ticket; } catch {}
+      } else if (typeof url_params === "object") {
+        ticket = url_params.ticket || url_params.TICKET;
+      }
     }
-    const ticket = params.ticket;
+
+    // 2) custom_fields.ticket (when you use a custom field named "ticket")
+    if (!ticket && custom_fields && typeof custom_fields === "object") {
+      ticket = custom_fields.ticket || custom_fields.TICKET;
+    }
+
+    // 3) fields[ticket] (how Gumroad posts ad-hoc fields)
+    if (!ticket && typeof req.body["fields[ticket]"] === "string") {
+      ticket = req.body["fields[ticket]"];
+    }
+
+    // 4) bare 'ticket' just in case
+    if (!ticket && typeof req.body.ticket === "string") {
+      ticket = req.body.ticket;
+    }
 
     if (!ticket || !tickets.has(ticket)) {
       console.log("PING: no matching ticket", { ticket });
       return res.status(200).send("No matching ticket");
     }
 
-    // Mark paid
     const rec = tickets.get(ticket);
     rec.paid = true;
     console.log("PING: OK (paid)", { ticket, cents });
-
     return res.status(200).send("OK");
   } catch (e) {
     console.error("gumroad/ping error:", e);
     return res.status(500).send("Ping handler error");
   }
 });
+
 
 
 // ---------- start ----------
