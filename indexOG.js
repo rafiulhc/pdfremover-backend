@@ -1,34 +1,42 @@
-// index.js
 const express = require("express");
 const multer = require("multer");
 const cors = require("cors");
 const { PDFDocument } = require("pdf-lib");
 const fs = require("fs");
 const path = require("path");
-const { spawn, execFile } = require("child_process");
+const { spawn } = require("child_process");
 const sharp = require("sharp");
 const app = express();
 const archiver = require("archiver");
 const { mkdtempSync, rmSync } = require("fs");
 const os = require("os");
 
-// ==== NEW: CloudConvert + helpers ====
+// ==== CloudConvert + helpers ====
 const CloudConvert = require("cloudconvert");
 const axios = require("axios");
 const { randomUUID } = require("crypto");
 
 const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY || "");
-const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "pdf2docx-pro";
+const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "ubtedo";
 const GUMROAD_MIN_PRICE_CENTS = parseInt(process.env.GUMROAD_MIN_PRICE_CENTS || "199", 10);
+const GUMROAD_ACCESS_TOKEN = process.env.GUMROAD_ACCESS_TOKEN || "";
 
-// tickets: memory map (fine for single dyno). If you use multiple dynos, move this to Redis.
+// tickets: memory map (single dyno). Use Redis if you scale multiple dynos.
 const tickets = new Map();
 /*
 tickets.set(ticketId, {
-  jobId, paid:false, ready:false, file:{url, filename} | null, createdAt:number, error:string|null
+  jobId, paid:false, ready:false, file:{url, filename}|null, createdAt:number, error:string|null
 });
 */
-
+// 🧹 Clean up old tickets every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, rec] of tickets) {
+    if (now - rec.createdAt > 2 * 60 * 60 * 1000) {
+      tickets.delete(t); // remove tickets older than 2 hours
+    }
+  }
+}, 30 * 60 * 1000); // every 30 minutes
 // ---------- basics ----------
 app.use(cors({
   origin: [
@@ -37,9 +45,12 @@ app.use(cors({
     "https://pdfmergersplitter.app",
     "https://www.pdfmergersplitter.app"
   ],
-  methods: ["POST", "GET", "OPTIONS"], // <--- GET added
+  methods: ["POST", "GET", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
+
+// Only parse Gumroad webhook as urlencoded
+app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 
 const OUTDIR = path.join(process.cwd(), "uploads");
 fs.mkdirSync(OUTDIR, { recursive: true });
@@ -57,7 +68,7 @@ function resolveSofficeBin() {
   for (const p of candidates) {
     try { if (fs.existsSync(p)) return p; } catch {}
   }
-  return "soffice"; // fall back to PATH
+  return "soffice";
 }
 const SOFFICE_CMD = resolveSofficeBin();
 console.log("Resolved soffice path:", SOFFICE_CMD);
@@ -95,7 +106,7 @@ function findConverted(outDir, baseNoExt, targetExt) {
   return path.join(outDir, newest);
 }
 
-/* ---------- routes (existing) ---------- */
+// ---------- routes (existing free tools) ----------
 
 /** Remove pages */
 app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
@@ -107,7 +118,7 @@ app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
       .split(",")
       .map(s => s.trim())
       .filter(Boolean)
-      .map(n => parseInt(n, 10) - 1); // zero-based
+      .map(n => parseInt(n, 10) - 1);
 
     const srcPdf = await PDFDocument.load(buffer);
     const total = srcPdf.getPageCount();
@@ -206,7 +217,7 @@ app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => 
   }
 });
 
-/** PDF -> DOCX (LibreOffice basic) */
+/** PDF -> DOCX (LibreOffice baseline, free) */
 app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -242,13 +253,13 @@ app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => 
     try {
       const cleanup =
         findConverted(outDir, baseNoExt, "docx") ||
-        findConverted(outDir, path.parse(tmpPath).name, "docx");
+      findConverted(outDir, path.parse(tmpPath).name, "docx");
       if (cleanup) fs.unlinkSync(cleanup);
     } catch {}
   }
 });
 
-// ---------- debug route (existing) ----------
+// ---------- debug route ----------
 app.get("/api/debug/soffice", (_req, res) => {
   const ls = p => (fs.existsSync(p) ? fs.readdirSync(p) : []);
   res.json({
@@ -336,7 +347,7 @@ app.post("/api/compress/image", upload.single("file"), async (req, res) => {
       outBuf = await pipeline.toBuffer();
 
       if (outBuf.length <= targetKb * 1024) break;
-      if (format === "webp" || format === "jpeg") {
+      if (format === "webp" || "jpeg") {
         quality = Math.max(45, quality - 8);
       }
       attempt++;
@@ -499,7 +510,7 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
   }
 });
 
-// ===================== NEW: PRO (CloudConvert + Gumroad) =====================
+// ===================== PRO (CloudConvert + Gumroad) =====================
 
 // Start a paid high-fidelity PDF->DOCX via CloudConvert; returns ticket + buyUrl
 app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
@@ -529,7 +540,6 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
       fs.createReadStream(req.file.path),
       origName
     );
-
     try { fs.unlinkSync(req.file.path); } catch {}
 
     tickets.set(ticket, {
@@ -541,7 +551,7 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
       error: null
     });
 
-    // async waiter
+    // async waiter for CC
     (async () => {
       try {
         const finished = await cloudConvert.jobs.wait(job.id);
@@ -560,6 +570,12 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
     })();
 
     const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}`;
+
+
+    // const buyUrl =
+    //   `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&fields[ticket]=${encodeURIComponent(ticket)}`;
+
+    console.log("PRO PREPARE RESP:", { ticket, buyUrl });
     return res.json({ ticket, buyUrl });
   } catch (e) {
     console.error("pro/prepare error:", e);
@@ -568,25 +584,69 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
   }
 });
 
-// OPTIONAL: disable etag globally (prevents 304s)
-// app.set('etag', false);
+// Gumroad reconciliation (in case webhook missed)
+async function reconcileGumroadPayment(ticket) {
+  try {
+    if (!process.env.GUMROAD_ACCESS_TOKEN) return false;
+    const token = process.env.GUMROAD_ACCESS_TOKEN;
+    const permalink = process.env.GUMROAD_PRODUCT_PERMALINK;
 
-app.get("/api/pro/status", (req, res) => {
+    // Look back 2 hours for the sale containing our ?ticket=...
+    const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const url = `https://api.gumroad.com/v2/sales?access_token=${encodeURIComponent(token)}&product_permalink=${encodeURIComponent(permalink)}&after=${encodeURIComponent(since)}`;
+
+    const { data } = await axios.get(url);
+    const sales = data?.sales || [];
+    for (const s of sales) {
+      const params = s.url_params || {};
+      const saleTicket = params.ticket || params.TICKET;
+      const refunded = String(s.refunded || "").toLowerCase() === "true";
+      if (!refunded && saleTicket === ticket) return true;
+    }
+  } catch (e) {
+    console.warn("reconcileGumroadPayment error:", e.message);
+  }
+  return false;
+}
+
+
+// Poll status (self-heal CC ready + payment reconciliation)
+app.get("/api/pro/status", async (req, res) => {
   const ticket = String(req.query.ticket || "");
   const rec = tickets.get(ticket);
   if (!rec) return res.status(404).json({ error: "Invalid ticket" });
 
-  // no-cache everywhere
+  // Never cache status
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
   res.set("Surrogate-Control", "no-store");
 
-  res.status(200).json({
-    paid: rec.paid,
-    ready: rec.ready,
-    error: rec.error || null
-  });
+  // Self-heal CloudConvert readiness
+  try {
+    if (!rec.ready && rec.jobId) {
+      const job = await cloudConvert.jobs.get(rec.jobId);
+      const files = cloudConvert.jobs.getExportUrls(job);
+      if (files && files[0]) {
+        rec.ready = true;
+        rec.file = files[0];
+        console.log("STATUS: CC ready via refresh", { ticket, filename: files[0].filename });
+      }
+    }
+  } catch { /* ignore */ }
+
+  // Self-heal payment via Gumroad API (if ping missed)
+  try {
+    if (!rec.paid) {
+      const paidNow = await reconcileGumroadPayment(ticket);
+      if (paidNow) {
+        rec.paid = true;
+        console.log("STATUS: payment reconciled from Gumroad API", { ticket });
+      }
+    }
+  } catch { /* ignore */ }
+
+  return res.status(200).json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
 });
 
 
@@ -612,44 +672,74 @@ app.get("/api/pro/download", async (req, res) => {
   }
 });
 
-// Gumroad Ping webhook (mark ticket as paid)
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 app.post("/api/gumroad/ping", (req, res) => {
   try {
-    const { product_permalink, price, refunded, url_params } = req.body;
+    const { product_permalink, price, refunded, url_params, custom_fields } = req.body;
 
-    if ((product_permalink || "").split("/").pop() !== GUMROAD_PRODUCT_PERMALINK) {
+    // product slug check
+    const slug = (product_permalink || "").split("/").pop();
+    if (slug !== GUMROAD_PRODUCT_PERMALINK) {
+      console.log("PING: wrong product", { slug, expected: GUMROAD_PRODUCT_PERMALINK });
       return res.status(400).send("Wrong product");
     }
+
+    // PPP-friendly: accept any positive payment
     const cents = parseInt(price || "0", 10);
-    if (Number.isNaN(cents) || cents < GUMROAD_MIN_PRICE_CENTS) {
-      return res.status(400).send("Underpaid");
+    if (!Number.isFinite(cents) || cents < 1) {
+      console.log("PING: no/zero price", { cents });
+      return res.status(400).send("No payment amount");
     }
+
+    // ignore refunds
     if (String(refunded || "").toLowerCase() === "true") {
+      console.log("PING: refunded");
       return res.status(200).send("Ignored (refunded)");
     }
 
-    let params = {};
-    if (typeof url_params === "string") {
-      try { params = JSON.parse(url_params); } catch { params = {}; }
-    } else if (typeof url_params === "object" && url_params) {
-      params = url_params;
+    // --- find ticket in multiple possible places ---
+    let ticket = undefined;
+
+    // 1) url_params.ticket (works when you use ?ticket=... in the checkout URL)
+    if (!ticket && url_params) {
+      if (typeof url_params === "string") {
+        try { ticket = JSON.parse(url_params).ticket; } catch {}
+      } else if (typeof url_params === "object") {
+        ticket = url_params.ticket || url_params.TICKET;
+      }
     }
 
-    const ticket = params.ticket;
+    // 2) custom_fields.ticket (when you use a custom field named "ticket")
+    if (!ticket && custom_fields && typeof custom_fields === "object") {
+      ticket = custom_fields.ticket || custom_fields.TICKET;
+    }
+
+    // 3) fields[ticket] (how Gumroad posts ad-hoc fields)
+    if (!ticket && typeof req.body["fields[ticket]"] === "string") {
+      ticket = req.body["fields[ticket]"];
+    }
+
+    // 4) bare 'ticket' just in case
+    if (!ticket && typeof req.body.ticket === "string") {
+      ticket = req.body.ticket;
+    }
+
     if (!ticket || !tickets.has(ticket)) {
+      console.log("PING: no matching ticket", { ticket });
       return res.status(200).send("No matching ticket");
     }
 
     const rec = tickets.get(ticket);
     rec.paid = true;
-
+    console.log("PING: OK (paid)", { ticket, cents });
     return res.status(200).send("OK");
   } catch (e) {
     console.error("gumroad/ping error:", e);
     return res.status(500).send("Ping handler error");
   }
 });
+
+
 
 // ---------- start ----------
 const PORT = process.env.PORT || 4000;
