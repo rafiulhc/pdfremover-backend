@@ -15,7 +15,7 @@ const os = require("os");
 // ==== NEW: CloudConvert + helpers ====
 const CloudConvert = require("cloudconvert");
 const axios = require("axios");
-const { nanoid } = require("nanoid");
+const { randomUUID } = require("crypto");
 
 const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY || "");
 const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "pdf2docx-pro";
@@ -506,7 +506,7 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   if (!process.env.CLOUDCONVERT_API_KEY) return res.status(500).json({ error: "CloudConvert not configured" });
 
-  const ticket = nanoid(21);
+  const ticket = randomUUID().replace(/-/g, "");
   const origName = req.file.originalname || "input.pdf";
 
   try {
