@@ -568,25 +568,65 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
   }
 });
 
-// OPTIONAL: disable etag globally (prevents 304s)
-// app.set('etag', false);
+async function reconcileGumroadPayment(ticket) {
+  try {
+    if (!process.env.GUMROAD_ACCESS_TOKEN) return false;
+    const token = process.env.GUMROAD_ACCESS_TOKEN;
+    const permalink = process.env.GUMROAD_PRODUCT_PERMALINK;
+    // Query recent sales for your product. Limit window to last 2 hours.
+    const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const url = `https://api.gumroad.com/v2/sales?access_token=${encodeURIComponent(token)}&product_permalink=${encodeURIComponent(permalink)}&after=${encodeURIComponent(since)}`;
+    const { data } = await axios.get(url);
+    const sales = data?.sales || [];
+    for (const s of sales) {
+      // gumroad returns url_params as object if present
+      const ticketInSale = s.url_params && (s.url_params.ticket || s.url_params.TICKET);
+      const refunded = String(s.refunded || "").toLowerCase() === "true";
+      if (!refunded && ticketInSale === ticket) return true;
+    }
+  } catch (e) {
+    console.warn("reconcileGumroadPayment error:", e.message);
+  }
+  return false;
+}
 
-app.get("/api/pro/status", (req, res) => {
+// replace your status route with this augmented version
+app.get("/api/pro/status", async (req, res) => {
   const ticket = String(req.query.ticket || "");
   const rec = tickets.get(ticket);
   if (!rec) return res.status(404).json({ error: "Invalid ticket" });
 
-  // no-cache everywhere
+  // never cache status
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
   res.set("Surrogate-Control", "no-store");
 
-  res.status(200).json({
-    paid: rec.paid,
-    ready: rec.ready,
-    error: rec.error || null
-  });
+  // Self-heal CloudConvert readiness
+  try {
+    if (!rec.ready && rec.jobId) {
+      const job = await cloudConvert.jobs.get(rec.jobId);
+      const files = cloudConvert.jobs.getExportUrls(job);
+      if (files && files[0]) {
+        rec.ready = true;
+        rec.file = files[0];
+        console.log("STATUS: CC ready via refresh", { ticket, filename: files[0].filename });
+      }
+    }
+  } catch { /* ignore */ }
+
+  // Self-heal payment via Gumroad API (if ping missed)
+  try {
+    if (!rec.paid) {
+      const paidNow = await reconcileGumroadPayment(ticket);
+      if (paidNow) {
+        rec.paid = true;
+        console.log("STATUS: payment reconciled from Gumroad API", { ticket });
+      }
+    }
+  } catch { /* ignore */ }
+
+  return res.status(200).json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
 });
 
 
