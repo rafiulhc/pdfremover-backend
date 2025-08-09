@@ -568,13 +568,27 @@ app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
   }
 });
 
-// Poll status (paid + ready)
+// OPTIONAL: disable etag globally (prevents 304s)
+// app.set('etag', false);
+
 app.get("/api/pro/status", (req, res) => {
   const ticket = String(req.query.ticket || "");
   const rec = tickets.get(ticket);
   if (!rec) return res.status(404).json({ error: "Invalid ticket" });
-  res.json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
+
+  // no-cache everywhere
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.set("Surrogate-Control", "no-store");
+
+  res.status(200).json({
+    paid: rec.paid,
+    ready: rec.ready,
+    error: rec.error || null
+  });
 });
+
 
 // Download if paid and ready (proxy stream from CloudConvert URL)
 app.get("/api/pro/download", async (req, res) => {
