@@ -11,6 +11,13 @@ const app = express();
 const archiver = require("archiver");
 const { mkdtempSync, rmSync } = require("fs");
 const os = require("os");
+const { pdfQueue } = require('./queue');
+const { v4: uuid } = require('uuid');
+// Job status
+const { Queue } = require('bullmq');
+const { connection } = require('./queue');
+const statusQ = new Queue('pdf-jobs', { connection });
+
 /* ---------- basics ---------- */
 app.use(cors({
   origin: [
@@ -76,6 +83,69 @@ function findConverted(outDir, baseNoExt, targetExt) {
   }
   return path.join(outDir, newest);
 }
+
+// Enqueue merge (job version)
+app.post("/api/jobs/merge", upload.array("files"), async (req, res) => {
+  try {
+    const uploadPaths = (req.files || []).map(f => f.path);
+    if (uploadPaths.length < 2) return res.status(400).json({ error: "Please upload at least two PDF files." });
+
+    const jobId = uuid();
+    await pdfQueue.add('merge', { uploadPaths, outName: 'merged.pdf' }, { jobId });
+    res.json({ jobId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "enqueue_failed" });
+  }
+});
+
+// Enqueue remove (job version)
+app.post("/api/jobs/remove", upload.single("file"), async (req, res) => {
+  try {
+    const removeIndices = (req.body.pagesToRemove || "")
+      .split(",").map(s => s.trim()).filter(Boolean)
+      .map(n => parseInt(n, 10) - 1);
+
+    const jobId = uuid();
+    await pdfQueue.add('remove', { uploadPath: req.file.path, removeIndices, outName: 'cleaned.pdf' }, { jobId });
+    res.json({ jobId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "enqueue_failed" });
+  }
+});
+
+// Enqueue docx->pdf (job version)
+app.post("/api/jobs/docx-to-pdf", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const jobId = uuid();
+    await pdfQueue.add('docx-to-pdf', { uploadPath: req.file.path, origName: req.file.originalname }, { jobId });
+    res.json({ jobId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "enqueue_failed" });
+  }
+});
+
+
+
+app.get("/api/jobs/:id", async (req, res) => {
+  const job = await statusQ.getJob(req.params.id);
+  if (!job) return res.status(404).json({ status: "not_found" });
+  const state = await job.getState();
+  const result = state === "completed" ? job.returnvalue : null;
+  res.json({ status: state, result });
+});
+
+// Simple download proxy if you return a local path (optional)
+app.get("/api/download", (req, res) => {
+  const p = req.query.p;
+  if (!p || typeof p !== 'string') return res.status(400).send('bad path');
+  // TODO: add validation so only /tmp or /uploads paths are allowed
+  res.download(p);
+});
+
 
 /* ---------- routes ---------- */
 
