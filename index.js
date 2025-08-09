@@ -605,13 +605,13 @@ app.get("/api/pro/status", async (req, res) => {
   const rec = tickets.get(ticket);
   if (!rec) return res.status(404).json({ error: "Invalid ticket" });
 
-  // no-cache everywhere
+  // Never cache status
   res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.set("Pragma", "no-cache");
   res.set("Expires", "0");
   res.set("Surrogate-Control", "no-store");
 
-  // refresh CC readiness if not yet captured
+  // Self-heal CloudConvert readiness
   try {
     if (!rec.ready && rec.jobId) {
       const job = await cloudConvert.jobs.get(rec.jobId);
@@ -622,9 +622,9 @@ app.get("/api/pro/status", async (req, res) => {
         console.log("STATUS: CC ready via refresh", { ticket, filename: files[0].filename });
       }
     }
-  } catch {}
+  } catch { /* ignore */ }
 
-  // reconcile payment if not yet marked paid
+  // Self-heal payment via Gumroad API (if ping missed)
   try {
     if (!rec.paid) {
       const paidNow = await reconcileGumroadPayment(ticket);
@@ -633,10 +633,11 @@ app.get("/api/pro/status", async (req, res) => {
         console.log("STATUS: payment reconciled from Gumroad API", { ticket });
       }
     }
-  } catch {}
+  } catch { /* ignore */ }
 
-  res.status(200).json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
+  return res.status(200).json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
 });
+
 
 // Download if paid and ready (proxy stream from CloudConvert URL)
 app.get("/api/pro/download", async (req, res) => {
