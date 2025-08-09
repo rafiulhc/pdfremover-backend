@@ -5,31 +5,23 @@ const cors = require("cors");
 const { PDFDocument } = require("pdf-lib");
 const fs = require("fs");
 const path = require("path");
-const { spawn, execFile } = require("child_process");
+const { spawn } = require("child_process");
 const sharp = require("sharp");
-const app = express();
 const archiver = require("archiver");
 const { mkdtempSync, rmSync } = require("fs");
 const os = require("os");
-
-// ==== NEW: CloudConvert + helpers ====
-const CloudConvert = require("cloudconvert");
-const axios = require("axios");
 const { randomUUID } = require("crypto");
+const axios = require("axios");
 
-const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY || "");
-const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "pdf2docx-pro";
-const GUMROAD_MIN_PRICE_CENTS = parseInt(process.env.GUMROAD_MIN_PRICE_CENTS || "199", 10);
+// --- CloudConvert (hi-fidelity PDF->DOCX) ---
+const CloudConvert = require("cloudconvert");
+const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY);
 
-// tickets: memory map (fine for single dyno). If you use multiple dynos, move this to Redis.
-const tickets = new Map();
-/*
-tickets.set(ticketId, {
-  jobId, paid:false, ready:false, file:{url, filename} | null, createdAt:number, error:string|null
-});
-*/
+// ---------- app + basics ----------
+const app = express();
+app.disable("x-powered-by");
 
-// ---------- basics ----------
+// CORS: include all your frontends
 app.use(cors({
   origin: [
     "http://localhost:3000",
@@ -37,14 +29,20 @@ app.use(cors({
     "https://pdfmergersplitter.app",
     "https://www.pdfmergersplitter.app"
   ],
-  methods: ["POST", "GET", "OPTIONS"], // <--- GET added
+  methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"]
 }));
+
+// For Gumroad webhook (form POST)
+app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 
 const OUTDIR = path.join(process.cwd(), "uploads");
 fs.mkdirSync(OUTDIR, { recursive: true });
 
 const upload = multer({ dest: OUTDIR });
+
+// In-memory ticket store (move to Redis if you scale to multiple dynos)
+const tickets = new Map(); // ticket -> { paid, ready, jobId, file, createdAt }
 
 // ---------- helpers ----------
 function resolveSofficeBin() {
@@ -57,7 +55,7 @@ function resolveSofficeBin() {
   for (const p of candidates) {
     try { if (fs.existsSync(p)) return p; } catch {}
   }
-  return "soffice"; // fall back to PATH
+  return "soffice";
 }
 const SOFFICE_CMD = resolveSofficeBin();
 console.log("Resolved soffice path:", SOFFICE_CMD);
@@ -68,16 +66,11 @@ function runSoffice(args, { timeoutMs = 120000 } = {}) {
       env: { ...process.env, HOME: process.env.HOME || "/tmp" },
     });
     let stderr = "", stdout = "";
-    const to = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} ; reject(new Error(`LibreOffice timeout after ${timeoutMs}ms`)); }, timeoutMs);
-
+    const to = setTimeout(() => { try { child.kill("SIGKILL"); } catch {}; reject(new Error(`LibreOffice timeout after ${timeoutMs}ms`)); }, timeoutMs);
     child.stdout.on("data", d => (stdout += d.toString()));
     child.stderr.on("data", d => (stderr += d.toString()));
     child.on("error", err => { clearTimeout(to); reject(new Error(`Failed to start soffice (${SOFFICE_CMD}): ${err.message}`)); });
-    child.on("close", code => {
-      clearTimeout(to);
-      if (code === 0) return resolve({ stdout, stderr });
-      reject(new Error(`soffice exited with code ${code}\n${stderr || stdout}`));
-    });
+    child.on("close", code => { clearTimeout(to); if (code === 0) return resolve({ stdout, stderr }); reject(new Error(`soffice exited with code ${code}\n${stderr || stdout}`)); });
   });
 }
 
@@ -95,19 +88,50 @@ function findConverted(outDir, baseNoExt, targetExt) {
   return path.join(outDir, newest);
 }
 
-/* ---------- routes (existing) ---------- */
+function runGhostscript(inputPath, outputPath, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const {
+      pdfsettings = "/ebook",
+      colorRes = 120,
+      grayRes = 120,
+      monoRes = 120
+    } = opts;
+    const args = [
+      "-sDEVICE=pdfwrite",
+      "-dCompatibilityLevel=1.4",
+      `-dPDFSETTINGS=${pdfsettings}`,
+      "-dNOPAUSE", "-dQUIET", "-dBATCH",
+      "-dDetectDuplicateImages=true",
+      "-dCompressFonts=true",
+      "-dSubsetFonts=true",
+      "-dDownsampleColorImages=true",
+      `-dColorImageResolution=${colorRes}`,
+      "-dDownsampleGrayImages=true",
+      `-dGrayImageResolution=${grayRes}`,
+      "-dDownsampleMonoImages=true",
+      `-dMonoImageResolution=${monoRes}`,
+      `-sOutputFile=${outputPath}`,
+      inputPath
+    ];
+    const child = spawn("gs", args);
+    let stderr = "";
+    child.stderr.on("data", d => (stderr += d.toString()));
+    child.on("error", err => reject(err));
+    child.on("close", code => { if (code === 0) return resolve(); reject(new Error(`Ghostscript exited ${code}: ${stderr}`)); });
+  });
+}
 
-/** Remove pages */
+// ---------- EXISTING ROUTES (unchanged) ----------
+
+// Remove pages
 app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
   try {
     const filePath = req.file.path;
     const buffer = fs.readFileSync(filePath);
 
     const pagesToRemove = (req.body.pagesToRemove || "")
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean)
-      .map(n => parseInt(n, 10) - 1); // zero-based
+      .split(",").map(s => s.trim()).filter(Boolean)
+      .map(n => parseInt(n, 10) - 1);
 
     const srcPdf = await PDFDocument.load(buffer);
     const total = srcPdf.getPageCount();
@@ -133,15 +157,13 @@ app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
   }
 });
 
-/** Merge PDFs */
+// Merge PDFs
 app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
   try {
     if (!req.files || req.files.length < 2) {
       return res.status(400).json({ error: "Please upload at least two PDF files." });
     }
-
     const mergedPdf = await PDFDocument.create();
-
     for (const file of req.files) {
       const buffer = fs.readFileSync(file.path);
       const pdf = await PDFDocument.load(buffer);
@@ -149,9 +171,7 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
       copiedPages.forEach((page) => mergedPdf.addPage(page));
       try { fs.unlinkSync(file.path); } catch {}
     }
-
     const mergedBytes = await mergedPdf.save();
-
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="merged.pdf"');
     res.send(Buffer.from(mergedBytes));
@@ -161,11 +181,10 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
   }
 });
 
-/** DOCX -> PDF */
+// DOCX -> PDF (LibreOffice)
 app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
   const tmpPath = req.file?.path;
   if (!tmpPath) return res.status(400).json({ error: "No file uploaded" });
-
   const origName = req.file.originalname || "input.docx";
   const baseNoExt = path.parse(origName).name;
   const outDir = OUTDIR;
@@ -178,11 +197,9 @@ app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => 
       "--outdir", outDir,
       tmpPath
     ]);
-
     const outFile =
       findConverted(outDir, baseNoExt, "pdf") ||
       findConverted(outDir, path.parse(tmpPath).name, "pdf");
-
     if (!outFile || !fs.existsSync(outFile)) throw new Error("Conversion output not found");
 
     res.setHeader("Content-Type", "application/pdf");
@@ -206,10 +223,9 @@ app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => 
   }
 });
 
-/** PDF -> DOCX (LibreOffice basic) */
+// PDF -> DOCX (LibreOffice baseline; free path)
 app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
   const tmpPath = req.file.path;
   const origName = req.file.originalname || "input.pdf";
   const baseNoExt = path.parse(origName).name;
@@ -223,13 +239,10 @@ app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => 
       "--outdir", outDir,
       tmpPath
     ]);
-
     const outFile =
       findConverted(outDir, baseNoExt, "docx") ||
       findConverted(outDir, path.parse(tmpPath).name, "docx");
-
     if (!outFile || !fs.existsSync(outFile)) throw new Error("Conversion output not found");
-
     const bytes = fs.readFileSync(outFile);
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     res.setHeader("Content-Disposition", 'attachment; filename="converted.docx"');
@@ -248,62 +261,9 @@ app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => 
   }
 });
 
-// ---------- debug route (existing) ----------
-app.get("/api/debug/soffice", (_req, res) => {
-  const ls = p => (fs.existsSync(p) ? fs.readdirSync(p) : []);
-  res.json({
-    resolved: SOFFICE_CMD,
-    exists: fs.existsSync(SOFFICE_CMD),
-    candidates: {
-      "/usr/bin": ls("/usr/bin"),
-      "/usr/lib/libreoffice/program": ls("/usr/lib/libreoffice/program"),
-    },
-    PATH: process.env.PATH
-  });
-});
-
-function runGhostscript(inputPath, outputPath, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const {
-      pdfsettings = "/ebook",
-      colorRes = 120,
-      grayRes = 120,
-      monoRes = 120
-    } = opts;
-
-    const args = [
-      "-sDEVICE=pdfwrite",
-      "-dCompatibilityLevel=1.4",
-      `-dPDFSETTINGS=${pdfsettings}`,
-      "-dNOPAUSE", "-dQUIET", "-dBATCH",
-      "-dDetectDuplicateImages=true",
-      "-dCompressFonts=true",
-      "-dSubsetFonts=true",
-      "-dDownsampleColorImages=true",
-      `-dColorImageResolution=${colorRes}`,
-      "-dDownsampleGrayImages=true",
-      `-dGrayImageResolution=${grayRes}`,
-      "-dDownsampleMonoImages=true",
-      `-dMonoImageResolution=${monoRes}`,
-      `-sOutputFile=${outputPath}`,
-      inputPath
-    ];
-
-    const child = spawn("gs", args);
-    let stderr = "";
-    child.stderr.on("data", d => (stderr += d.toString()));
-    child.on("error", err => reject(err));
-    child.on("close", code => {
-      if (code === 0) return resolve();
-      reject(new Error(`Ghostscript exited ${code}: ${stderr}`));
-    });
-  });
-}
-
-/** compress image */
+// Compress image
 app.post("/api/compress/image", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
   const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10));
   let format = String((req.body.format || "webp")).toLowerCase();
   if (format === "jpg") format = "jpeg";
@@ -320,35 +280,20 @@ app.post("/api/compress/image", upload.single("file"), async (req, res) => {
     let outBuf = null;
 
     while (attempt < 10) {
-      const candidateWidth =
-        attempt < 4 ? width : Math.max(600, Math.floor(width * Math.pow(0.85, attempt - 3)));
-
+      const candidateWidth = attempt < 4 ? width : Math.max(600, Math.floor(width * Math.pow(0.85, attempt - 3)));
       let pipeline = sharp(input).resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true });
 
-      if (format === "webp") {
-        pipeline = pipeline.webp({ quality, effort: 4 });
-      } else if (format === "jpeg") {
-        pipeline = pipeline.flatten({ background: "#ffffff" }).jpeg({ quality, mozjpeg: true });
-      } else if (format === "png") {
-        pipeline = pipeline.png({ compressionLevel: 9, palette: true });
-      }
+      if (format === "webp") pipeline = pipeline.webp({ quality, effort: 4 });
+      else if (format === "jpeg") pipeline = pipeline.flatten({ background: "#ffffff" }).jpeg({ quality, mozjpeg: true });
+      else pipeline = pipeline.png({ compressionLevel: 9, palette: true });
 
       outBuf = await pipeline.toBuffer();
-
       if (outBuf.length <= targetKb * 1024) break;
-      if (format === "webp" || format === "jpeg") {
-        quality = Math.max(45, quality - 8);
-      }
+      if (format === "webp" || format === "jpeg") quality = Math.max(45, quality - 8);
       attempt++;
     }
-
-    const ct =
-      format === "webp" ? "image/webp" :
-      format === "jpeg" ? "image/jpeg" : "image/png";
-    const ext =
-      format === "webp" ? "webp" :
-      format === "jpeg" ? "jpg" : "png";
-
+    const ct = format === "webp" ? "image/webp" : (format === "jpeg" ? "image/jpeg" : "image/png");
+    const ext = format === "webp" ? "webp" : (format === "jpeg" ? "jpg" : "png");
     res.setHeader("Content-Type", ct);
     res.setHeader("Content-Disposition", `attachment; filename="compressed.${ext}"`);
     res.send(outBuf);
@@ -360,11 +305,10 @@ app.post("/api/compress/image", upload.single("file"), async (req, res) => {
   }
 });
 
-/** compress pdf */
+// Compress PDF
 app.post("/api/compress/pdf", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   const targetKb = Math.max(100, parseInt(req.body.targetKb || "500", 10));
-
   const inPath = req.file.path;
   const base = path.parse(inPath).name;
   const outPath = path.join(OUTDIR, `${base}-compressed.pdf`);
@@ -375,17 +319,14 @@ app.post("/api/compress/pdf", upload.single("file"), async (req, res) => {
       { pdfsettings: "/screen", colorRes: 120, grayRes: 120, monoRes: 120 },
       { pdfsettings: "/screen", colorRes: 96, grayRes: 96, monoRes: 96 }
     ];
-
     for (const t of tries) {
       await runGhostscript(inPath, outPath, t);
       const size = fs.existsSync(outPath) ? fs.statSync(outPath).size : Infinity;
       if (size <= targetKb * 1024) break;
       fs.copyFileSync(outPath, inPath);
     }
-
     if (!fs.existsSync(outPath)) throw new Error("No output file");
     const buf = fs.readFileSync(outPath);
-
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="compressed.pdf"');
     res.send(buf);
@@ -398,49 +339,30 @@ app.post("/api/compress/pdf", upload.single("file"), async (req, res) => {
   }
 });
 
-/** images -> pdf */
+// Images -> PDF
 app.post("/api/convert/images-to-pdf", upload.array("files"), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: "Please upload at least one image." });
     }
-
     const pdfDoc = await PDFDocument.create();
-
     for (const f of req.files) {
       const bytes = fs.readFileSync(f.path);
-      let img, dims;
-
-      if ((f.mimetype || "").includes("jpeg") || f.originalname.toLowerCase().endsWith(".jpg")) {
-        img = await pdfDoc.embedJpg(bytes);
-      } else if ((f.mimetype || "").includes("png") || f.originalname.toLowerCase().endsWith(".png")) {
-        img = await pdfDoc.embedPng(bytes);
-      } else {
-        try { img = await pdfDoc.embedJpg(bytes); } catch {
-          img = await pdfDoc.embedPng(bytes);
-        }
-      }
-      dims = img.scale(1);
-
-      const A4 = { w: 595.28, h: 841.89 };
-      const margin = 24;
-      const maxW = A4.w - margin * 2;
-      const maxH = A4.h - margin * 2;
-
+      let img;
+      if ((f.mimetype || "").includes("jpeg") || f.originalname.toLowerCase().endsWith(".jpg")) img = await pdfDoc.embedJpg(bytes);
+      else if ((f.mimetype || "").includes("png") || f.originalname.toLowerCase().endsWith(".png")) img = await pdfDoc.embedPng(bytes);
+      else { try { img = await pdfDoc.embedJpg(bytes); } catch { img = await pdfDoc.embedPng(bytes); } }
+      const dims = img.scale(1);
+      const A4 = { w: 595.28, h: 841.89 }, margin = 24;
+      const maxW = A4.w - margin * 2, maxH = A4.h - margin * 2;
       const scale = Math.min(maxW / dims.width, maxH / dims.height, 1);
-      const w = dims.width * scale;
-      const h = dims.height * scale;
-      const x = (A4.w - w) / 2;
-      const y = (A4.h - h) / 2;
-
+      const w = dims.width * scale, h = dims.height * scale;
+      const x = (A4.w - w) / 2, y = (A4.h - h) / 2;
       const page = pdfDoc.addPage([A4.w, A4.h]);
       page.drawImage(img, { x, y, width: w, height: h });
     }
-
     const out = await pdfDoc.save();
-
     for (const f of req.files) { try { fs.unlinkSync(f.path); } catch {} }
-
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="images.pdf"');
     res.send(Buffer.from(out));
@@ -450,10 +372,9 @@ app.post("/api/convert/images-to-pdf", upload.array("files"), async (req, res) =
   }
 });
 
-/** pdf -> images (zip) */
+// PDF -> images (ZIP)
 app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
   const pdfPath = req.file.path;
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), "pdfimgs-"));
   const prefix = path.join(tmpDir, "page");
@@ -467,15 +388,9 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
       p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err || `pdftoppm exited ${code}`))));
       p.on("error", reject);
     });
-
     const files = fs.readdirSync(tmpDir)
       .filter((f) => f.endsWith(".png"))
-      .sort((a, b) => {
-        const na = parseInt(a.split("-").pop(), 10);
-        const nb = parseInt(b.split("-").pop(), 10);
-        return na - nb;
-      });
-
+      .sort((a, b) => parseInt(a.split("-").pop(), 10) - parseInt(b.split("-").pop(), 10));
     if (files.length === 0) throw new Error("No images generated from PDF.");
 
     res.setHeader("Content-Type", "application/zip");
@@ -484,11 +399,7 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
     const archive = archiver("zip", { zlib: { level: 9 } });
     archive.on("error", (err) => { throw err; });
     archive.pipe(res);
-
-    for (const f of files) {
-      const p = path.join(tmpDir, f);
-      archive.file(p, { name: f });
-    }
+    for (const f of files) archive.file(path.join(tmpDir, f), { name: f });
     await archive.finalize();
   } catch (e) {
     console.error("pdf->images error:", e);
@@ -499,89 +410,111 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
   }
 });
 
-// ===================== NEW: PRO (CloudConvert + Gumroad) =====================
+// ---------- PRO: PDF -> DOCX via CloudConvert + Gumroad ----------
 
-// Start a paid high-fidelity PDF->DOCX via CloudConvert; returns ticket + buyUrl
+// 1) Prepare job and return a ticket (Frontend: then open Gumroad with fields[ticket]=TICKET)
 app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-  if (!process.env.CLOUDCONVERT_API_KEY) return res.status(500).json({ error: "CloudConvert not configured" });
-
-  const ticket = randomUUID().replace(/-/g, "");
-  const origName = req.file.originalname || "input.pdf";
-
   try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    const isPdf = (req.file.mimetype === "application/pdf") || req.file.originalname.toLowerCase().endsWith(".pdf");
+    if (!isPdf) return res.status(400).json({ error: "Please upload a PDF" });
+
+    const ticket = randomUUID().replace(/-/g, "");
+    const filename = req.file.originalname || "input.pdf";
+    const filePath = req.file.path;
+
+    // Create CC job: import/upload -> convert -> export/url
     const job = await cloudConvert.jobs.create({
       tasks: {
-        'import-1': { operation: 'import/upload' },
-        'convert-1': {
-          operation: 'convert',
-          input: 'import-1',
-          input_format: 'pdf',
-          output_format: 'docx'
+        "import-1": { operation: "import/upload" },
+        "convert-1": {
+          operation: "convert",
+          input: "import-1",
+          input_format: "pdf",
+          output_format: "docx",
+          // You can tune options here if needed (OCR, etc.)
         },
-        'export-1': { operation: 'export/url', input: 'convert-1' }
+        "export-1": { operation: "export/url", input: "convert-1" }
       }
     });
 
-    const uploadTask = job.tasks.find(t => t.name === 'import-1');
-    await cloudConvert.tasks.upload(
-      uploadTask,
-      fs.createReadStream(req.file.path),
-      origName
-    );
+    // Upload the file to the import task
+    const uploadTask = job.tasks.find(t => t.name === "import-1");
+    await cloudConvert.tasks.upload(uploadTask, fs.createReadStream(filePath), filename);
+    try { fs.unlinkSync(filePath); } catch {}
 
-    try { fs.unlinkSync(req.file.path); } catch {}
+    // Store ticket
+    tickets.set(ticket, { paid: false, ready: false, jobId: job.id, file: null, createdAt: Date.now() });
 
-    tickets.set(ticket, {
-      jobId: job.id,
-      paid: false,
-      ready: false,
-      file: null,
-      createdAt: Date.now(),
-      error: null
-    });
-
-    // async waiter
-    (async () => {
-      try {
-        const finished = await cloudConvert.jobs.wait(job.id);
-        const files = cloudConvert.jobs.getExportUrls(finished);
-        const file = files && files[0];
-        const rec = tickets.get(ticket);
-        if (rec) {
-          rec.ready = !!file;
-          rec.file = file || null;
-          if (!file) rec.error = "No export URL from CloudConvert";
-        }
-      } catch (e) {
-        const rec = tickets.get(ticket);
-        if (rec) rec.error = e.message || "CloudConvert failed";
-      }
-    })();
-
-    const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}`;
-    return res.json({ ticket, buyUrl });
+    console.log("PRO PREPARED:", { ticket, jobId: job.id, filename });
+    res.json({ ticket });
   } catch (e) {
     console.error("pro/prepare error:", e);
-    try { fs.unlinkSync(req.file.path); } catch {}
-    return res.status(500).json({ error: "Failed to initialize conversion" });
+    res.status(500).json({ error: "Failed to prepare conversion" });
   }
 });
 
+// 2) Gumroad webhook (marks ticket as paid)
+function toCents(val) {
+  if (val == null) return NaN;
+  const s = String(val).trim();
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const n = Number(s);
+  if (!Number.isFinite(n)) return NaN;
+  return Math.round(n * 100);
+}
+
+app.post("/api/gumroad/ping", (req, res) => {
+  try {
+    console.log("GUMROAD PING BODY:", req.body);
+
+    const expected = (process.env.GUMROAD_PRODUCT_PERMALINK || "").trim();
+    const pp = String(req.body.product_permalink || req.body.permalink || "").trim();
+    const ppSlug = pp.includes("/l/") ? pp.split("/l/").pop() : pp.split("/").pop();
+
+    const cents = toCents(req.body.price);
+    const minCents = parseInt(process.env.GUMROAD_MIN_PRICE_CENTS || "199", 10);
+    const isRefunded = String(req.body.refunded || "").toLowerCase() === "true";
+
+    let params = {};
+    if (typeof req.body.url_params === "string") { try { params = JSON.parse(req.body.url_params); } catch {} }
+    else if (req.body.url_params && typeof req.body.url_params === "object") { params = req.body.url_params; }
+
+    const cfTicket = req.body?.custom_fields?.ticket;
+    const cfTicketAlt = req.body['custom_fields[ticket]'];
+    const ticket = (params.ticket || cfTicket || cfTicketAlt || "").toString();
+
+    if (ppSlug !== expected && pp !== expected) { console.warn("PING: wrong product", { pp, ppSlug, expected }); return res.status(200).send("Wrong product"); }
+    if (!Number.isFinite(cents))                  { console.warn("PING: bad price", { raw: req.body.price });      return res.status(200).send("Bad price"); }
+    if (cents < minCents)                         { console.warn("PING: underpaid", { cents, minCents });          return res.status(200).send("Underpaid"); }
+    if (isRefunded)                               { console.warn("PING: refunded");                                 return res.status(200).send("Refunded"); }
+    if (!ticket)                                  { console.warn("PING: missing ticket");                           return res.status(200).send("No ticket"); }
+    if (!tickets.has(ticket))                     { console.warn("PING: no matching ticket", { ticket });           return res.status(200).send("No matching ticket"); }
+
+    tickets.get(ticket).paid = true;
+    console.log("PING: success, ticket paid", { ticket, cents });
+    return res.status(200).send("OK");
+  } catch (e) {
+    console.error("gumroad/ping error:", e);
+    return res.status(200).send("OK"); // don't force retries
+  }
+});
+
+// Gumroad reconciliation (if webhook missed)
 async function reconcileGumroadPayment(ticket) {
   try {
-    if (!process.env.GUMROAD_ACCESS_TOKEN) return false;
     const token = process.env.GUMROAD_ACCESS_TOKEN;
+    if (!token) return false;
     const permalink = process.env.GUMROAD_PRODUCT_PERMALINK;
-    // Query recent sales for your product. Limit window to last 2 hours.
     const since = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
     const url = `https://api.gumroad.com/v2/sales?access_token=${encodeURIComponent(token)}&product_permalink=${encodeURIComponent(permalink)}&after=${encodeURIComponent(since)}`;
     const { data } = await axios.get(url);
     const sales = data?.sales || [];
     for (const s of sales) {
-      // gumroad returns url_params as object if present
-      const ticketInSale = s.url_params && (s.url_params.ticket || s.url_params.TICKET);
       const refunded = String(s.refunded || "").toLowerCase() === "true";
+      const ticketInSale =
+        (s.url_params && (s.url_params.ticket || s.url_params.TICKET)) ||
+        (s.custom_fields && s.custom_fields.ticket);
       if (!refunded && ticketInSale === ticket) return true;
     }
   } catch (e) {
@@ -590,7 +523,7 @@ async function reconcileGumroadPayment(ticket) {
   return false;
 }
 
-// replace your status route with this augmented version
+// 3) Status: no-cache + self-heal (payment + CC readiness)
 app.get("/api/pro/status", async (req, res) => {
   const ticket = String(req.query.ticket || "");
   const rec = tickets.get(ticket);
@@ -602,7 +535,7 @@ app.get("/api/pro/status", async (req, res) => {
   res.set("Expires", "0");
   res.set("Surrogate-Control", "no-store");
 
-  // Self-heal CloudConvert readiness
+  // Self-heal CC readiness (even if waiter missed)
   try {
     if (!rec.ready && rec.jobId) {
       const job = await cloudConvert.jobs.get(rec.jobId);
@@ -615,7 +548,7 @@ app.get("/api/pro/status", async (req, res) => {
     }
   } catch { /* ignore */ }
 
-  // Self-heal payment via Gumroad API (if ping missed)
+  // Self-heal payment via Gumroad Sales API
   try {
     if (!rec.paid) {
       const paidNow = await reconcileGumroadPayment(ticket);
@@ -629,69 +562,32 @@ app.get("/api/pro/status", async (req, res) => {
   return res.status(200).json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
 });
 
-
-// Download if paid and ready (proxy stream from CloudConvert URL)
+// 4) Download: only when paid & ready
 app.get("/api/pro/download", async (req, res) => {
-  const ticket = String(req.query.ticket || "");
-  const rec = tickets.get(ticket);
-  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
-  if (rec.error) return res.status(500).json({ error: rec.error });
-  if (!rec.paid) return res.status(402).json({ error: "Payment required" });
-  if (!rec.ready || !rec.file?.url) return res.status(425).json({ error: "Conversion not ready yet" });
-
   try {
-    const filename = (rec.file.filename || "converted.docx").replace(/[/\\]/g, "_");
+    const ticket = String(req.query.ticket || "");
+    const rec = tickets.get(ticket);
+    if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+    if (!rec.paid) return res.status(402).json({ error: "Payment required" });
+    if (!rec.ready || !rec.file) return res.status(425).json({ error: "Not ready yet" });
+
+    // Fetch file from CloudConvert export URL and stream it
+    const fileUrl = rec.file.url;
+    const filename = rec.file.filename || "converted.docx";
+    const resp = await axios.get(fileUrl, { responseType: "arraybuffer" });
+
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-
-    const stream = await axios.get(rec.file.url, { responseType: "stream" });
-    stream.data.pipe(res);
+    return res.send(Buffer.from(resp.data));
   } catch (e) {
-    console.error("download error:", e);
-    res.status(500).json({ error: "Failed to fetch file" });
+    console.error("pro/download error:", e);
+    return res.status(500).json({ error: "Download failed" });
   }
 });
 
-// Gumroad Ping webhook (mark ticket as paid)
-app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
-app.post("/api/gumroad/ping", (req, res) => {
-  try {
-    const { product_permalink, price, refunded, url_params } = req.body;
+// ---------- Debug helpers (optional; remove later) ----------
 
-    if ((product_permalink || "").split("/").pop() !== GUMROAD_PRODUCT_PERMALINK) {
-      return res.status(400).send("Wrong product");
-    }
-    const cents = parseInt(price || "0", 10);
-    if (Number.isNaN(cents) || cents < GUMROAD_MIN_PRICE_CENTS) {
-      return res.status(400).send("Underpaid");
-    }
-    if (String(refunded || "").toLowerCase() === "true") {
-      return res.status(200).send("Ignored (refunded)");
-    }
-
-    let params = {};
-    if (typeof url_params === "string") {
-      try { params = JSON.parse(url_params); } catch { params = {}; }
-    } else if (typeof url_params === "object" && url_params) {
-      params = url_params;
-    }
-
-    const ticket = params.ticket;
-    if (!ticket || !tickets.has(ticket)) {
-      return res.status(200).send("No matching ticket");
-    }
-
-    const rec = tickets.get(ticket);
-    rec.paid = true;
-
-    return res.status(200).send("OK");
-  } catch (e) {
-    console.error("gumroad/ping error:", e);
-    return res.status(500).send("Ping handler error");
-  }
-});
-
-// Show what we know about a ticket
+// View a ticket record
 app.get("/api/pro/debug/ticket", (req, res) => {
   const t = String(req.query.ticket || "");
   const rec = tickets.get(t);
@@ -699,19 +595,50 @@ app.get("/api/pro/debug/ticket", (req, res) => {
   res.json({ ticket: t, ...rec });
 });
 
-// (Optional) Ask CloudConvert directly about the job
+// Query CloudConvert job tasks
 app.get("/api/pro/debug/cc", async (req, res) => {
   try {
     const t = String(req.query.ticket || "");
     const rec = tickets.get(t);
     if (!rec) return res.status(404).json({ error: "No such ticket" });
     const job = await cloudConvert.jobs.get(rec.jobId);
-    res.json({ ticket: t, jobId: rec.jobId, status: job.status, tasks: job.tasks?.map(x => ({ name: x.name, status: x.status, result: x.result })) });
+    res.json({
+      ticket: t,
+      jobId: rec.jobId,
+      status: job.status,
+      tasks: job.tasks?.map(x => ({ name: x.name, status: x.status, result: x.result }))
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+// Force mark paid (ONLY for debugging; guard with secret to be safe)
+app.post("/api/pro/force-paid", (req, res) => {
+  const t = String(req.query.ticket || "");
+  const secret = String(req.query.secret || "");
+  if (process.env.FORCE_ADMIN_SECRET && secret !== process.env.FORCE_ADMIN_SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const rec = tickets.get(t);
+  if (!rec) return res.status(404).json({ error: "invalid ticket" });
+  rec.paid = true;
+  return res.json({ ok: true });
+});
+
+// ---------- debug route from original ----------
+app.get("/api/debug/soffice", (_req, res) => {
+  const ls = p => (fs.existsSync(p) ? fs.readdirSync(p) : []);
+  res.json({
+    resolved: SOFFICE_CMD,
+    exists: fs.existsSync(SOFFICE_CMD),
+    candidates: {
+      "/usr/bin": ls("/usr/bin"),
+      "/usr/lib/libreoffice/program": ls("/usr/lib/libreoffice/program"),
+    },
+    PATH: process.env.PATH
+  });
+});
 
 // ---------- start ----------
 const PORT = process.env.PORT || 4000;
