@@ -1,5 +1,8 @@
 build:
   docker:
     web: Dockerfile
+    worker: Dockerfile   # reuse the same image
 run:
-  web: node index.js
+  web: node index.js     # starts your API
+  worker: node worker.js # starts your BullMQ worker
+
