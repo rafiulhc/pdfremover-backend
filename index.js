@@ -651,6 +651,28 @@ app.post("/api/gumroad/ping", (req, res) => {
   }
 });
 
+// Show what we know about a ticket
+app.get("/api/pro/debug/ticket", (req, res) => {
+  const t = String(req.query.ticket || "");
+  const rec = tickets.get(t);
+  if (!rec) return res.status(404).json({ error: "No such ticket" });
+  res.json({ ticket: t, ...rec });
+});
+
+// (Optional) Ask CloudConvert directly about the job
+app.get("/api/pro/debug/cc", async (req, res) => {
+  try {
+    const t = String(req.query.ticket || "");
+    const rec = tickets.get(t);
+    if (!rec) return res.status(404).json({ error: "No such ticket" });
+    const job = await cloudConvert.jobs.get(rec.jobId);
+    res.json({ ticket: t, jobId: rec.jobId, status: job.status, tasks: job.tasks?.map(x => ({ name: x.name, status: x.status, result: x.result })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 // ---------- start ----------
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Backend running on :${PORT}`));
