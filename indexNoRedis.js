@@ -8,7 +8,9 @@ const path = require("path");
 const { spawn, execFile } = require("child_process");
 const sharp = require("sharp");
 const app = express();
-
+const archiver = require("archiver");
+const { mkdtempSync, rmSync } = require("fs");
+const os = require("os");
 /* ---------- basics ---------- */
 app.use(cors({
   origin: [
@@ -290,54 +292,71 @@ function runGhostscript(inputPath, outputPath, opts = {}) {
    * Form: file (image), targetKb? (default 500)
    * Output: webp (image/webp)
    */
-  app.post("/api/compress/image", upload.single("file"), async (req, res) => {
+  // POST /api/compress/image
+// form-data: file, targetKb (optional), format (optional: webp|jpeg|png)
+app.post("/api/compress/image", upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10)); // safety floor 50KB
+
+    const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10));
+    let format = String((req.body.format || "webp")).toLowerCase();
+    if (format === "jpg") format = "jpeg";
+    if (!["webp", "jpeg", "png"].includes(format)) format = "webp";
 
     const inPath = req.file.path;
-    const tmpOut = path.join(OUTDIR, `${path.parse(inPath).name}.webp`);
-
     try {
-      // Read input & probe dimensions
       const input = fs.readFileSync(inPath);
       const meta = await sharp(input).metadata();
-      let { width } = meta;
+      let width = meta.width || 2000;
 
-      // Start fairly high quality, then step down
-      let quality = 82; // webp quality
+      let quality = 82;             // used for webp/jpeg
       let attempt = 0;
       let outBuf = null;
 
-      while (attempt < 8) {
-        // If still too big after quality steps, reduce width by ~15% each loop (but not below 600)
+      while (attempt < 10) {
         const candidateWidth =
-          attempt < 4 ? width : Math.max(600, Math.floor((width || 2000) * Math.pow(0.85, attempt - 3)));
+          attempt < 4 ? width : Math.max(600, Math.floor(width * Math.pow(0.85, attempt - 3)));
 
-        outBuf = await sharp(input)
-          .resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true })
-          .webp({ quality, effort: 4 })
-          .toBuffer();
+        let pipeline = sharp(input).resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true });
+
+        if (format === "webp") {
+          pipeline = pipeline.webp({ quality, effort: 4 });
+        } else if (format === "jpeg") {
+          // JPEG can’t do transparency — flatten to white so you don’t get black boxes
+          pipeline = pipeline.flatten({ background: "#ffffff" }).jpeg({ quality, mozjpeg: true });
+        } else if (format === "png") {
+          // PNG doesn’t have “quality”; use palette + max compression (size driven by dimensions)
+          pipeline = pipeline.png({ compressionLevel: 9, palette: true });
+        }
+
+        outBuf = await pipeline.toBuffer();
 
         if (outBuf.length <= targetKb * 1024) break;
 
-        // drop quality; then resolution if needed
-        quality = Math.max(45, quality - 8);
+        // If too big: drop quality for webp/jpeg, else keep reducing width
+        if (format === "webp" || format === "jpeg") {
+          quality = Math.max(45, quality - 8);
+        }
         attempt++;
       }
 
-      if (!outBuf) throw new Error("Compression failed");
+      const ct =
+        format === "webp" ? "image/webp" :
+        format === "jpeg" ? "image/jpeg" : "image/png";
+      const ext =
+        format === "webp" ? "webp" :
+        format === "jpeg" ? "jpg" : "png";
 
-      res.setHeader("Content-Type", "image/webp");
-      res.setHeader("Content-Disposition", 'attachment; filename="compressed.webp"');
+      res.setHeader("Content-Type", ct);
+      res.setHeader("Content-Disposition", `attachment; filename="compressed.${ext}"`);
       res.send(outBuf);
     } catch (e) {
       console.error("image compress error:", e);
       res.status(500).json({ error: "Failed to compress image" });
     } finally {
       try { fs.unlinkSync(inPath); } catch {}
-      try { fs.unlinkSync(tmpOut); } catch {}
     }
   });
+
 
   /**
    * POST /api/compress/pdf
@@ -385,6 +404,113 @@ function runGhostscript(inputPath, outputPath, opts = {}) {
       try { fs.unlinkSync(outPath); } catch {}
     }
   });
+
+  // routes: add near your other endpoints
+app.post("/api/convert/images-to-pdf", upload.array("files"), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "Please upload at least one image." });
+    }
+
+    const pdfDoc = await PDFDocument.create();
+
+    for (const f of req.files) {
+      const bytes = fs.readFileSync(f.path);
+      let img, dims;
+
+      // Try embed as JPEG first, fallback to PNG
+      if ((f.mimetype || "").includes("jpeg") || f.originalname.toLowerCase().endsWith(".jpg")) {
+        img = await pdfDoc.embedJpg(bytes);
+      } else if ((f.mimetype || "").includes("png") || f.originalname.toLowerCase().endsWith(".png")) {
+        img = await pdfDoc.embedPng(bytes);
+      } else {
+        // generic attempt: try JPG then PNG
+        try { img = await pdfDoc.embedJpg(bytes); } catch {
+          img = await pdfDoc.embedPng(bytes);
+        }
+      }
+      dims = img.scale(1);
+
+      // A4 in points
+      const A4 = { w: 595.28, h: 841.89 };
+      // Fit image into A4 (with 24pt margin)
+      const margin = 24;
+      const maxW = A4.w - margin * 2;
+      const maxH = A4.h - margin * 2;
+
+      const scale = Math.min(maxW / dims.width, maxH / dims.height, 1);
+      const w = dims.width * scale;
+      const h = dims.height * scale;
+      const x = (A4.w - w) / 2;
+      const y = (A4.h - h) / 2;
+
+      const page = pdfDoc.addPage([A4.w, A4.h]);
+      page.drawImage(img, { x, y, width: w, height: h });
+    }
+
+    const out = await pdfDoc.save();
+
+    // cleanup temp files
+    for (const f of req.files) { try { fs.unlinkSync(f.path); } catch {} }
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="images.pdf"');
+    res.send(Buffer.from(out));
+  } catch (e) {
+    console.error("images->pdf error:", e);
+    res.status(500).json({ error: "Failed to build PDF from images" });
+  }
+});
+
+app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+  const pdfPath = req.file.path;
+  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "pdfimgs-"));
+  const prefix = path.join(tmpDir, "page"); // pdftoppm will create page-1.png etc.
+
+  try {
+    // Render at 144 DPI for balance (change -rx/-ry for quality/speed/size)
+    const args = ["-png", "-rx", "144", "-ry", "144", pdfPath, prefix];
+    await new Promise((resolve, reject) => {
+      const p = spawn("pdftoppm", args);
+      let err = "";
+      p.stderr.on("data", (d) => (err += d.toString()));
+      p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err || `pdftoppm exited ${code}`))));
+      p.on("error", reject);
+    });
+
+    // Collect generated PNGs (pdftoppm names them like page-1.png, page-2.png)
+    const files = fs.readdirSync(tmpDir)
+      .filter((f) => f.endsWith(".png"))
+      .sort((a, b) => {
+        const na = parseInt(a.split("-").pop(), 10);
+        const nb = parseInt(b.split("-").pop(), 10);
+        return na - nb;
+      });
+
+    if (files.length === 0) throw new Error("No images generated from PDF.");
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="pages.zip"');
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (err) => { throw err; });
+    archive.pipe(res);
+
+    for (const f of files) {
+      const p = path.join(tmpDir, f);
+      archive.file(p, { name: f }); // add as page-1.png, page-2.png, ...
+    }
+    await archive.finalize();
+  } catch (e) {
+    console.error("pdf->images error:", e);
+    res.status(500).json({ error: "Failed to convert PDF to images" });
+  } finally {
+    try { fs.unlinkSync(pdfPath); } catch {}
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+});
 
 /* ---------- start ---------- */
 const PORT = process.env.PORT || 4000;

@@ -11,7 +11,25 @@ const app = express();
 const archiver = require("archiver");
 const { mkdtempSync, rmSync } = require("fs");
 const os = require("os");
-/* ---------- basics ---------- */
+
+// ==== NEW: CloudConvert + helpers ====
+const CloudConvert = require("cloudconvert");
+const axios = require("axios");
+const { nanoid } = require("nanoid");
+
+const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY || "");
+const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "pdf2docx-pro";
+const GUMROAD_MIN_PRICE_CENTS = parseInt(process.env.GUMROAD_MIN_PRICE_CENTS || "199", 10);
+
+// tickets: memory map (fine for single dyno). If you use multiple dynos, move this to Redis.
+const tickets = new Map();
+/*
+tickets.set(ticketId, {
+  jobId, paid:false, ready:false, file:{url, filename} | null, createdAt:number, error:string|null
+});
+*/
+
+// ---------- basics ----------
 app.use(cors({
   origin: [
     "http://localhost:3000",
@@ -19,7 +37,7 @@ app.use(cors({
     "https://pdfmergersplitter.app",
     "https://www.pdfmergersplitter.app"
   ],
-  methods: ["POST", "OPTIONS"],
+  methods: ["POST", "GET", "OPTIONS"], // <--- GET added
   allowedHeaders: ["Content-Type"]
 }));
 
@@ -28,7 +46,7 @@ fs.mkdirSync(OUTDIR, { recursive: true });
 
 const upload = multer({ dest: OUTDIR });
 
-/* ---------- helpers ---------- */
+// ---------- helpers ----------
 function resolveSofficeBin() {
   if (process.env.SOFFICE_BIN) return process.env.SOFFICE_BIN;
   const candidates = [
@@ -77,7 +95,7 @@ function findConverted(outDir, baseNoExt, targetExt) {
   return path.join(outDir, newest);
 }
 
-/* ---------- routes ---------- */
+/* ---------- routes (existing) ---------- */
 
 /** Remove pages */
 app.post("/api/remove-pages", upload.single("file"), async (req, res) => {
@@ -188,7 +206,7 @@ app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => 
   }
 });
 
-/** PDF -> DOCX (layout quality depends on source PDF) */
+/** PDF -> DOCX (LibreOffice basic) */
 app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -230,7 +248,7 @@ app.post("/api/convert/pdf-to-docx", upload.single("file"), async (req, res) => 
   }
 });
 
-/* ---------- single debug route (keep while troubleshooting) ---------- */
+// ---------- debug route (existing) ----------
 app.get("/api/debug/soffice", (_req, res) => {
   const ls = p => (fs.existsSync(p) ? fs.readdirSync(p) : []);
   res.json({
@@ -245,167 +263,142 @@ app.get("/api/debug/soffice", (_req, res) => {
 });
 
 function runGhostscript(inputPath, outputPath, opts = {}) {
-    return new Promise((resolve, reject) => {
-      const {
-        pdfsettings = "/ebook", // /screen (smallest), /ebook, /printer, /prepress
-        colorRes = 120,         // dpi downsample target
-        grayRes = 120,
-        monoRes = 120
-      } = opts;
+  return new Promise((resolve, reject) => {
+    const {
+      pdfsettings = "/ebook",
+      colorRes = 120,
+      grayRes = 120,
+      monoRes = 120
+    } = opts;
 
-      // Common GS flags for size reduction
-      const args = [
-        "-sDEVICE=pdfwrite",
-        "-dCompatibilityLevel=1.4",
-        `-dPDFSETTINGS=${pdfsettings}`,
-        "-dNOPAUSE", "-dQUIET", "-dBATCH",
-        "-dDetectDuplicateImages=true",
-        "-dCompressFonts=true",
-        "-dSubsetFonts=true",
+    const args = [
+      "-sDEVICE=pdfwrite",
+      "-dCompatibilityLevel=1.4",
+      `-dPDFSETTINGS=${pdfsettings}`,
+      "-dNOPAUSE", "-dQUIET", "-dBATCH",
+      "-dDetectDuplicateImages=true",
+      "-dCompressFonts=true",
+      "-dSubsetFonts=true",
+      "-dDownsampleColorImages=true",
+      `-dColorImageResolution=${colorRes}`,
+      "-dDownsampleGrayImages=true",
+      `-dGrayImageResolution=${grayRes}`,
+      "-dDownsampleMonoImages=true",
+      `-dMonoImageResolution=${monoRes}`,
+      `-sOutputFile=${outputPath}`,
+      inputPath
+    ];
 
-        "-dDownsampleColorImages=true",
-        `-dColorImageResolution=${colorRes}`,
-
-        "-dDownsampleGrayImages=true",
-        `-dGrayImageResolution=${grayRes}`,
-
-        "-dDownsampleMonoImages=true",
-        `-dMonoImageResolution=${monoRes}`,
-
-        `-sOutputFile=${outputPath}`,
-        inputPath
-      ];
-
-      const child = spawn("gs", args);
-      let stderr = "";
-      child.stderr.on("data", d => (stderr += d.toString()));
-      child.on("error", err => reject(err));
-      child.on("close", code => {
-        if (code === 0) return resolve();
-        reject(new Error(`Ghostscript exited ${code}: ${stderr}`));
-      });
+    const child = spawn("gs", args);
+    let stderr = "";
+    child.stderr.on("data", d => (stderr += d.toString()));
+    child.on("error", err => reject(err));
+    child.on("close", code => {
+      if (code === 0) return resolve();
+      reject(new Error(`Ghostscript exited ${code}: ${stderr}`));
     });
-  }
+  });
+}
 
-  /**
-   * POST /api/compress/image
-   * Form: file (image), targetKb? (default 500)
-   * Output: webp (image/webp)
-   */
-  // POST /api/compress/image
-// form-data: file, targetKb (optional), format (optional: webp|jpeg|png)
+/** compress image */
 app.post("/api/compress/image", upload.single("file"), async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10));
-    let format = String((req.body.format || "webp")).toLowerCase();
-    if (format === "jpg") format = "jpeg";
-    if (!["webp", "jpeg", "png"].includes(format)) format = "webp";
+  const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10));
+  let format = String((req.body.format || "webp")).toLowerCase();
+  if (format === "jpg") format = "jpeg";
+  if (!["webp", "jpeg", "png"].includes(format)) format = "webp";
 
-    const inPath = req.file.path;
-    try {
-      const input = fs.readFileSync(inPath);
-      const meta = await sharp(input).metadata();
-      let width = meta.width || 2000;
+  const inPath = req.file.path;
+  try {
+    const input = fs.readFileSync(inPath);
+    const meta = await sharp(input).metadata();
+    let width = meta.width || 2000;
 
-      let quality = 82;             // used for webp/jpeg
-      let attempt = 0;
-      let outBuf = null;
+    let quality = 82;
+    let attempt = 0;
+    let outBuf = null;
 
-      while (attempt < 10) {
-        const candidateWidth =
-          attempt < 4 ? width : Math.max(600, Math.floor(width * Math.pow(0.85, attempt - 3)));
+    while (attempt < 10) {
+      const candidateWidth =
+        attempt < 4 ? width : Math.max(600, Math.floor(width * Math.pow(0.85, attempt - 3)));
 
-        let pipeline = sharp(input).resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true });
+      let pipeline = sharp(input).resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true });
 
-        if (format === "webp") {
-          pipeline = pipeline.webp({ quality, effort: 4 });
-        } else if (format === "jpeg") {
-          // JPEG can’t do transparency — flatten to white so you don’t get black boxes
-          pipeline = pipeline.flatten({ background: "#ffffff" }).jpeg({ quality, mozjpeg: true });
-        } else if (format === "png") {
-          // PNG doesn’t have “quality”; use palette + max compression (size driven by dimensions)
-          pipeline = pipeline.png({ compressionLevel: 9, palette: true });
-        }
-
-        outBuf = await pipeline.toBuffer();
-
-        if (outBuf.length <= targetKb * 1024) break;
-
-        // If too big: drop quality for webp/jpeg, else keep reducing width
-        if (format === "webp" || format === "jpeg") {
-          quality = Math.max(45, quality - 8);
-        }
-        attempt++;
+      if (format === "webp") {
+        pipeline = pipeline.webp({ quality, effort: 4 });
+      } else if (format === "jpeg") {
+        pipeline = pipeline.flatten({ background: "#ffffff" }).jpeg({ quality, mozjpeg: true });
+      } else if (format === "png") {
+        pipeline = pipeline.png({ compressionLevel: 9, palette: true });
       }
 
-      const ct =
-        format === "webp" ? "image/webp" :
-        format === "jpeg" ? "image/jpeg" : "image/png";
-      const ext =
-        format === "webp" ? "webp" :
-        format === "jpeg" ? "jpg" : "png";
+      outBuf = await pipeline.toBuffer();
 
-      res.setHeader("Content-Type", ct);
-      res.setHeader("Content-Disposition", `attachment; filename="compressed.${ext}"`);
-      res.send(outBuf);
-    } catch (e) {
-      console.error("image compress error:", e);
-      res.status(500).json({ error: "Failed to compress image" });
-    } finally {
-      try { fs.unlinkSync(inPath); } catch {}
-    }
-  });
-
-
-  /**
-   * POST /api/compress/pdf
-   * Form: file (pdf), targetKb? (default 500)
-   * Output: application/pdf
-   */
-  app.post("/api/compress/pdf", upload.single("file"), async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const targetKb = Math.max(100, parseInt(req.body.targetKb || "500", 10)); // floor 100KB for legibility
-
-    const inPath = req.file.path;
-    const base = path.parse(inPath).name;
-    const outPath = path.join(OUTDIR, `${base}-compressed.pdf`);
-
-    try {
-      // Iteratively try tighter presets/resolutions
-      const tries = [
-        { pdfsettings: "/ebook", colorRes: 144, grayRes: 144, monoRes: 144 },
-        { pdfsettings: "/screen", colorRes: 120, grayRes: 120, monoRes: 120 },
-        { pdfsettings: "/screen", colorRes: 96, grayRes: 96, monoRes: 96 }
-      ];
-
-      let ok = false;
-      for (const t of tries) {
-        await runGhostscript(inPath, outPath, t);
-        const size = fs.existsSync(outPath) ? fs.statSync(outPath).size : Infinity;
-        if (size <= targetKb * 1024) { ok = true; break; }
-
-        // If still too large, feed the output back in for another pass
-        fs.copyFileSync(outPath, inPath);
+      if (outBuf.length <= targetKb * 1024) break;
+      if (format === "webp" || format === "jpeg") {
+        quality = Math.max(45, quality - 8);
       }
-
-      if (!fs.existsSync(outPath)) throw new Error("No output file");
-      const buf = fs.readFileSync(outPath);
-
-      // We return the best effort even if slightly above target
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", 'attachment; filename="compressed.pdf"');
-      res.send(buf);
-    } catch (e) {
-      console.error("pdf compress error:", e);
-      res.status(500).json({ error: "Failed to compress PDF" });
-    } finally {
-      try { fs.unlinkSync(inPath); } catch {}
-      try { fs.unlinkSync(outPath); } catch {}
+      attempt++;
     }
-  });
 
-  // routes: add near your other endpoints
+    const ct =
+      format === "webp" ? "image/webp" :
+      format === "jpeg" ? "image/jpeg" : "image/png";
+    const ext =
+      format === "webp" ? "webp" :
+      format === "jpeg" ? "jpg" : "png";
+
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Content-Disposition", `attachment; filename="compressed.${ext}"`);
+    res.send(outBuf);
+  } catch (e) {
+    console.error("image compress error:", e);
+    res.status(500).json({ error: "Failed to compress image" });
+  } finally {
+    try { fs.unlinkSync(inPath); } catch {}
+  }
+});
+
+/** compress pdf */
+app.post("/api/compress/pdf", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const targetKb = Math.max(100, parseInt(req.body.targetKb || "500", 10));
+
+  const inPath = req.file.path;
+  const base = path.parse(inPath).name;
+  const outPath = path.join(OUTDIR, `${base}-compressed.pdf`);
+
+  try {
+    const tries = [
+      { pdfsettings: "/ebook", colorRes: 144, grayRes: 144, monoRes: 144 },
+      { pdfsettings: "/screen", colorRes: 120, grayRes: 120, monoRes: 120 },
+      { pdfsettings: "/screen", colorRes: 96, grayRes: 96, monoRes: 96 }
+    ];
+
+    for (const t of tries) {
+      await runGhostscript(inPath, outPath, t);
+      const size = fs.existsSync(outPath) ? fs.statSync(outPath).size : Infinity;
+      if (size <= targetKb * 1024) break;
+      fs.copyFileSync(outPath, inPath);
+    }
+
+    if (!fs.existsSync(outPath)) throw new Error("No output file");
+    const buf = fs.readFileSync(outPath);
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="compressed.pdf"');
+    res.send(buf);
+  } catch (e) {
+    console.error("pdf compress error:", e);
+    res.status(500).json({ error: "Failed to compress PDF" });
+  } finally {
+    try { fs.unlinkSync(inPath); } catch {}
+    try { fs.unlinkSync(outPath); } catch {}
+  }
+});
+
+/** images -> pdf */
 app.post("/api/convert/images-to-pdf", upload.array("files"), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
@@ -418,22 +411,18 @@ app.post("/api/convert/images-to-pdf", upload.array("files"), async (req, res) =
       const bytes = fs.readFileSync(f.path);
       let img, dims;
 
-      // Try embed as JPEG first, fallback to PNG
       if ((f.mimetype || "").includes("jpeg") || f.originalname.toLowerCase().endsWith(".jpg")) {
         img = await pdfDoc.embedJpg(bytes);
       } else if ((f.mimetype || "").includes("png") || f.originalname.toLowerCase().endsWith(".png")) {
         img = await pdfDoc.embedPng(bytes);
       } else {
-        // generic attempt: try JPG then PNG
         try { img = await pdfDoc.embedJpg(bytes); } catch {
           img = await pdfDoc.embedPng(bytes);
         }
       }
       dims = img.scale(1);
 
-      // A4 in points
       const A4 = { w: 595.28, h: 841.89 };
-      // Fit image into A4 (with 24pt margin)
       const margin = 24;
       const maxW = A4.w - margin * 2;
       const maxH = A4.h - margin * 2;
@@ -450,7 +439,6 @@ app.post("/api/convert/images-to-pdf", upload.array("files"), async (req, res) =
 
     const out = await pdfDoc.save();
 
-    // cleanup temp files
     for (const f of req.files) { try { fs.unlinkSync(f.path); } catch {} }
 
     res.setHeader("Content-Type", "application/pdf");
@@ -462,15 +450,15 @@ app.post("/api/convert/images-to-pdf", upload.array("files"), async (req, res) =
   }
 });
 
+/** pdf -> images (zip) */
 app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
   const pdfPath = req.file.path;
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), "pdfimgs-"));
-  const prefix = path.join(tmpDir, "page"); // pdftoppm will create page-1.png etc.
+  const prefix = path.join(tmpDir, "page");
 
   try {
-    // Render at 144 DPI for balance (change -rx/-ry for quality/speed/size)
     const args = ["-png", "-rx", "144", "-ry", "144", pdfPath, prefix];
     await new Promise((resolve, reject) => {
       const p = spawn("pdftoppm", args);
@@ -480,7 +468,6 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
       p.on("error", reject);
     });
 
-    // Collect generated PNGs (pdftoppm names them like page-1.png, page-2.png)
     const files = fs.readdirSync(tmpDir)
       .filter((f) => f.endsWith(".png"))
       .sort((a, b) => {
@@ -500,7 +487,7 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
 
     for (const f of files) {
       const p = path.join(tmpDir, f);
-      archive.file(p, { name: f }); // add as page-1.png, page-2.png, ...
+      archive.file(p, { name: f });
     }
     await archive.finalize();
   } catch (e) {
@@ -512,6 +499,144 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
   }
 });
 
-/* ---------- start ---------- */
+// ===================== NEW: PRO (CloudConvert + Gumroad) =====================
+
+// Start a paid high-fidelity PDF->DOCX via CloudConvert; returns ticket + buyUrl
+app.post("/api/pro/prepare", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  if (!process.env.CLOUDCONVERT_API_KEY) return res.status(500).json({ error: "CloudConvert not configured" });
+
+  const ticket = nanoid(21);
+  const origName = req.file.originalname || "input.pdf";
+
+  try {
+    const job = await cloudConvert.jobs.create({
+      tasks: {
+        'import-1': { operation: 'import/upload' },
+        'convert-1': {
+          operation: 'convert',
+          input: 'import-1',
+          input_format: 'pdf',
+          output_format: 'docx'
+        },
+        'export-1': { operation: 'export/url', input: 'convert-1' }
+      }
+    });
+
+    const uploadTask = job.tasks.find(t => t.name === 'import-1');
+    await cloudConvert.tasks.upload(
+      uploadTask,
+      fs.createReadStream(req.file.path),
+      origName
+    );
+
+    try { fs.unlinkSync(req.file.path); } catch {}
+
+    tickets.set(ticket, {
+      jobId: job.id,
+      paid: false,
+      ready: false,
+      file: null,
+      createdAt: Date.now(),
+      error: null
+    });
+
+    // async waiter
+    (async () => {
+      try {
+        const finished = await cloudConvert.jobs.wait(job.id);
+        const files = cloudConvert.jobs.getExportUrls(finished);
+        const file = files && files[0];
+        const rec = tickets.get(ticket);
+        if (rec) {
+          rec.ready = !!file;
+          rec.file = file || null;
+          if (!file) rec.error = "No export URL from CloudConvert";
+        }
+      } catch (e) {
+        const rec = tickets.get(ticket);
+        if (rec) rec.error = e.message || "CloudConvert failed";
+      }
+    })();
+
+    const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}`;
+    return res.json({ ticket, buyUrl });
+  } catch (e) {
+    console.error("pro/prepare error:", e);
+    try { fs.unlinkSync(req.file.path); } catch {}
+    return res.status(500).json({ error: "Failed to initialize conversion" });
+  }
+});
+
+// Poll status (paid + ready)
+app.get("/api/pro/status", (req, res) => {
+  const ticket = String(req.query.ticket || "");
+  const rec = tickets.get(ticket);
+  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+  res.json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
+});
+
+// Download if paid and ready (proxy stream from CloudConvert URL)
+app.get("/api/pro/download", async (req, res) => {
+  const ticket = String(req.query.ticket || "");
+  const rec = tickets.get(ticket);
+  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+  if (rec.error) return res.status(500).json({ error: rec.error });
+  if (!rec.paid) return res.status(402).json({ error: "Payment required" });
+  if (!rec.ready || !rec.file?.url) return res.status(425).json({ error: "Conversion not ready yet" });
+
+  try {
+    const filename = (rec.file.filename || "converted.docx").replace(/[/\\]/g, "_");
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    const stream = await axios.get(rec.file.url, { responseType: "stream" });
+    stream.data.pipe(res);
+  } catch (e) {
+    console.error("download error:", e);
+    res.status(500).json({ error: "Failed to fetch file" });
+  }
+});
+
+// Gumroad Ping webhook (mark ticket as paid)
+app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
+app.post("/api/gumroad/ping", (req, res) => {
+  try {
+    const { product_permalink, price, refunded, url_params } = req.body;
+
+    if ((product_permalink || "").split("/").pop() !== GUMROAD_PRODUCT_PERMALINK) {
+      return res.status(400).send("Wrong product");
+    }
+    const cents = parseInt(price || "0", 10);
+    if (Number.isNaN(cents) || cents < GUMROAD_MIN_PRICE_CENTS) {
+      return res.status(400).send("Underpaid");
+    }
+    if (String(refunded || "").toLowerCase() === "true") {
+      return res.status(200).send("Ignored (refunded)");
+    }
+
+    let params = {};
+    if (typeof url_params === "string") {
+      try { params = JSON.parse(url_params); } catch { params = {}; }
+    } else if (typeof url_params === "object" && url_params) {
+      params = url_params;
+    }
+
+    const ticket = params.ticket;
+    if (!ticket || !tickets.has(ticket)) {
+      return res.status(200).send("No matching ticket");
+    }
+
+    const rec = tickets.get(ticket);
+    rec.paid = true;
+
+    return res.status(200).send("OK");
+  } catch (e) {
+    console.error("gumroad/ping error:", e);
+    return res.status(500).send("Ping handler error");
+  }
+});
+
+// ---------- start ----------
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Backend running on :${PORT}`));

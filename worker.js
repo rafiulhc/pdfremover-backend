@@ -6,7 +6,88 @@ const { promises: fsp } = require('fs');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { connection } = require('./queue');
+
+const path = require('path');
+const axios = require('axios');
+const FormData = require('form-data');
+const { Worker, connection } = require('./queue');
+
+const CC = axios.create({
+  baseURL: 'https://api.cloudconvert.com/v2',
+  headers: { Authorization: `Bearer ${process.env.CLOUDCONVERT_API_KEY}` }
+});
+
+async function convertPdfToDocxWithCC(inputPath) {
+  // 1) Create job (import/upload -> convert -> export/url)
+  const { data: jobResp } = await CC.post('/jobs', {
+    tasks: {
+      'import-1': { operation: 'import/upload' },
+      'convert-1': {
+        operation: 'convert',
+        input: 'import-1',
+        output_format: 'docx',
+        engine: 'office',
+        // help preserve layout as well as possible:
+        pdf_a: false,
+        page_range: null
+      },
+      'export-1': { operation: 'export/url', input: 'convert-1' }
+    }
+  });
+
+  const jobId = jobResp.data.id;
+  const importTask = jobResp.data.tasks.find(t => t.name === 'import-1');
+
+  // 2) Upload file to the given signed URL
+  const upload = importTask.result?.form;
+  if (!upload?.url) throw new Error('CloudConvert import URL missing');
+
+  const form = new FormData();
+  for (const [k, v] of Object.entries(upload.parameters || {})) {
+    form.append(k, v);
+  }
+  form.append('file', fs.createReadStream(inputPath));
+  await axios.post(upload.url, form, { headers: form.getHeaders() });
+
+  // 3) Poll job until finished
+  let exportUrl = null;
+  for (;;) {
+    await new Promise(r => setTimeout(r, 2000));
+    const { data: j } = await CC.get(`/jobs/${jobId}`);
+    const state = j.data.status;
+    if (state === 'finished') {
+      const exportTask = j.data.tasks.find(t => t.name === 'export-1');
+      exportUrl = exportTask?.result?.files?.[0]?.url;
+      break;
+    }
+    if (state === 'error' || state === 'failed' || state === 'canceled') {
+      throw new Error(`CloudConvert job failed (${state})`);
+    }
+  }
+
+  if (!exportUrl) throw new Error('No export URL produced');
+
+  // 4) Download the result to a temp file
+  const outPath = path.join('/tmp', `docx-${Date.now()}.docx`);
+  const dl = await axios.get(exportUrl, { responseType: 'arraybuffer' });
+  fs.writeFileSync(outPath, Buffer.from(dl.data));
+  return outPath;
+}
+
+new Worker(
+  'cc-pdf2docx',
+  async job => {
+    const { uploadPath } = job.data;
+    const outPath = await convertPdfToDocxWithCC(uploadPath);
+    try { fs.unlinkSync(uploadPath); } catch {}
+    // Return a path the API can serve via /api/download
+    return { downloadPath: outPath };
+  },
+  { connection, concurrency: 2 }
+);
+
+console.log('Worker up: cc-pdf2docx');
+
 
 const OUTDIR = path.join(process.cwd(), "uploads");
 fs.mkdirSync(OUTDIR, { recursive: true });

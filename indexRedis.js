@@ -17,6 +17,19 @@ const { v4: uuid } = require('uuid');
 const { Queue } = require('bullmq');
 const { connection } = require('./queue');
 const statusQ = new Queue('pdf-jobs', { connection });
+// top of file
+const { buildQueue, connection } = require('./queue');
+const IORedis = require('ioredis');
+const axios = require('axios');
+const redis = new IORedis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false
+});
+const multer = require('multer');
+const upload = multer({ dest: path.join(process.cwd(), 'uploads') });
+
+const { q: premiumQ } = buildQueue('cc-pdf2docx');
+
 
 /* ---------- basics ---------- */
 app.use(cors({
@@ -33,7 +46,24 @@ app.use(cors({
 const OUTDIR = path.join(process.cwd(), "uploads");
 fs.mkdirSync(OUTDIR, { recursive: true });
 
-const upload = multer({ dest: OUTDIR });
+const { Queue } = require('bullmq');
+
+
+app.get('/api/jobs/premium/:id', async (req, res) => {
+  const job = await statusQ.getJob(req.params.id);
+  if (!job) return res.status(404).json({ status: 'not_found' });
+  const state = await job.getState();
+  const result = state === 'completed' ? job.returnvalue : null;
+  res.json({ status: state, result });
+});
+
+app.get('/api/download', (req, res) => {
+  const p = req.query.p;
+  if (!p || typeof p !== 'string') return res.status(400).send('bad path');
+  // (optional) add a whitelist: p must begin with /tmp
+  res.download(p);
+});
+
 
 /* ---------- helpers ---------- */
 function resolveSofficeBin() {
@@ -581,6 +611,69 @@ app.post("/api/convert/pdf-to-images", upload.single("file"), async (req, res) =
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 });
+
+// Verify a sale_id belongs to your product and wasn’t refunded/chargeback.
+// Also enforce single-use via Redis key "sale_used:<sale_id>"
+app.get('/api/pay/verify', async (req, res) => {
+  const { sale_id } = req.query;
+  if (!sale_id) return res.status(400).json({ valid: false, error: 'missing sale_id' });
+
+  // If you want single use:
+  const already = await redis.get(`sale_used:${sale_id}`);
+  if (already) return res.json({ valid: false, error: 'sale_id already used' });
+
+  try {
+    const url = `https://api.gumroad.com/v2/sales/${sale_id}`;
+    const { data } = await axios.get(url, {
+      headers: { Authorization: `Bearer ${process.env.GUMROAD_ACCESS_TOKEN}` }
+    });
+
+    if (!data?.success) return res.json({ valid: false, error: 'not found' });
+
+    const sale = data.sale;
+    const ok =
+      sale.product_id === process.env.GUMROAD_PRODUCT_ID &&
+      sale.refunded === false &&
+      sale.chargebacked === false;
+
+    if (!ok) return res.json({ valid: false, error: 'invalid sale' });
+
+    // reserve (mark as used) now — or you can move this to enqueue step
+    await redis.setex(`sale_used:${sale_id}`, 3600 * 24, '1'); // usable once for 24h
+    res.json({ valid: true });
+  } catch (e) {
+    console.error('gumroad verify error', e?.response?.data || e.message);
+    res.status(500).json({ valid: false, error: 'verify_failed' });
+  }
+});
+
+app.post('/api/jobs/premium/pdf-to-docx', upload.single('file'), async (req, res) => {
+  try {
+    const { sale_id } = req.body;
+    if (!sale_id) return res.status(400).json({ error: 'sale_id required' });
+    if (!req.file) return res.status(400).json({ error: 'file required' });
+
+    // Ensure sale_id is reserved (created by /api/pay/verify) and not already consumed by a job
+    const used = await redis.get(`sale_used:${sale_id}`);
+    if (!used) return res.status(400).json({ error: 'sale_id not verified/expired' });
+
+    // Optional: prevent duplicate enqueue
+    const consumed = await redis.get(`sale_consumed:${sale_id}`);
+    if (consumed) return res.status(400).json({ error: 'sale_id already consumed' });
+
+    const jobId = uuid();
+    await premiumQ.add('cc', { uploadPath: req.file.path }, { jobId });
+
+    // mark consumed (so only one job can be created for this sale)
+    await redis.setex(`sale_consumed:${sale_id}`, 3600 * 24, jobId);
+
+    res.json({ jobId });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'enqueue_failed' });
+  }
+});
+
 
 /* ---------- start ---------- */
 const PORT = process.env.PORT || 4000;
