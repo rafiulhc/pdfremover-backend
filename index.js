@@ -28,7 +28,15 @@ tickets.set(ticketId, {
   jobId, paid:false, ready:false, file:{url, filename}|null, createdAt:number, error:string|null
 });
 */
-
+// 🧹 Clean up old tickets every 30 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, rec] of tickets) {
+    if (now - rec.createdAt > 2 * 60 * 60 * 1000) {
+      tickets.delete(t); // remove tickets older than 2 hours
+    }
+  }
+}, 30 * 60 * 1000); // every 30 minutes
 // ---------- basics ----------
 app.use(cors({
   origin: [
