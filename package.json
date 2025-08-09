@@ -12,13 +12,16 @@
   "dependencies": {
     "archiver": "^7.0.1",
     "axios": "^1.11.0",
+    "bullmq": "^5.56.9",
     "child_process": "^1.0.2",
     "cloudconvert": "^3.0.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
+    "ioredis": "^5.7.0",
     "multer": "^2.0.2",
     "pdf-lib": "^1.17.1",
-    "sharp": "^0.34.3"
+    "sharp": "^0.34.3",
+    "uuid": "^11.1.0"
   }
 }
