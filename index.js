@@ -600,42 +600,74 @@ app.get("/api/pro/download", async (req, res) => {
 
 // Gumroad Ping webhook (mark ticket as paid)
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
+
+function toCents(val) {
+  if (val == null) return NaN;
+  const s = String(val).trim();
+  if (/^\d+$/.test(s)) return parseInt(s, 10);  // "199" -> 199
+  const n = Number(s);                           // "1.99" -> 1.99
+  if (!Number.isFinite(n)) return NaN;
+  return Math.round(n * 100);                    // -> 199
+}
+
 app.post("/api/gumroad/ping", (req, res) => {
   try {
-    const { product_permalink, price, refunded, url_params } = req.body;
+    console.log("GUMROAD PING BODY:", req.body);
 
-    if ((product_permalink || "").split("/").pop() !== GUMROAD_PRODUCT_PERMALINK) {
-      return res.status(400).send("Wrong product");
-    }
-    const cents = parseInt(price || "0", 10);
-    if (Number.isNaN(cents) || cents < GUMROAD_MIN_PRICE_CENTS) {
-      return res.status(400).send("Underpaid");
-    }
-    if (String(refunded || "").toLowerCase() === "true") {
-      return res.status(200).send("Ignored (refunded)");
-    }
+    const expected = (process.env.GUMROAD_PRODUCT_PERMALINK || "").trim();
+    let { product_permalink, price, refunded, url_params } = req.body;
 
+    // normalize permalink (accept slug or full URL)
+    const pp = String(product_permalink || "").trim();
+    const ppSlug = pp.includes("/l/") ? pp.split("/l/").pop() : pp.split("/").pop();
+
+    // parse price robustly
+    const cents = toCents(price);
+    const minCents = parseInt(process.env.GUMROAD_MIN_PRICE_CENTS || "199", 10);
+
+    // parse url_params for ticket
     let params = {};
-    if (typeof url_params === "string") {
-      try { params = JSON.parse(url_params); } catch { params = {}; }
-    } else if (typeof url_params === "object" && url_params) {
-      params = url_params;
-    }
-
+    if (typeof url_params === "string") { try { params = JSON.parse(url_params); } catch {} }
+    else if (url_params && typeof url_params === "object") { params = url_params; }
     const ticket = params.ticket;
-    if (!ticket || !tickets.has(ticket)) {
-      return res.status(200).send("No matching ticket");
+
+    const isRefunded = String(refunded || "").toLowerCase() === "true";
+
+    // Debug-friendly: explain, but don't 400
+    if (ppSlug !== expected && pp !== expected) {
+      console.warn("PING: wrong product", { pp, ppSlug, expected });
+      return res.status(200).send("Wrong product (debug)");
+    }
+    if (!Number.isFinite(cents)) {
+      console.warn("PING: price not parsable", { raw: price });
+      return res.status(200).send("Bad price (debug)");
+    }
+    if (cents < minCents) {
+      console.warn("PING: underpaid", { cents, minCents, raw: price });
+      return res.status(200).send("Underpaid (debug)");
+    }
+    if (isRefunded) {
+      console.warn("PING: refunded");
+      return res.status(200).send("Refunded (ignored)");
+    }
+    if (!ticket) {
+      console.warn("PING: missing ticket in url_params");
+      return res.status(200).send("No ticket (debug)");
+    }
+    if (!tickets.has(ticket)) {
+      console.warn("PING: no matching ticket", { ticket });
+      return res.status(200).send("No matching ticket (debug)");
     }
 
-    const rec = tickets.get(ticket);
-    rec.paid = true;
-
+    tickets.get(ticket).paid = true;
+    console.log("PING: success, ticket paid", { ticket, cents });
     return res.status(200).send("OK");
   } catch (e) {
     console.error("gumroad/ping error:", e);
-    return res.status(500).send("Ping handler error");
+    return res.status(200).send("OK");
   }
 });
+
 
 // ---------- start ----------
 const PORT = process.env.PORT || 4000;
