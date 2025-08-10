@@ -131,98 +131,132 @@ function buildATSResumeDocx(data) {
     role = "",
     summary = "",
     skills = [],
-    experience = [],
-    education = [],
+    experience = [], // [{company, title, start, end, bullets:[]}]
+    education = [],  // [{school, degree, start, end}]
   } = data;
+
+  // Colors
+  const BLUE = "2F5496";   // headings / name
+  const META = "555555";   // subtext (dates, contact)
+  const BODY = "000000";   // main text
 
   const doc = new Document({
     styles: {
       paragraphStyles: [
         {
-          id: "NormalPara",
-          name: "Normal",
+          id: "Body",
+          name: "Body",
           basedOn: "Normal",
-          run: { font: "Calibri", size: 22 },
-          paragraph: { spacing: { line: 276, after: 120 } },
+          run: { font: "Calibri", size: 22, color: BODY },              // 11pt
+          paragraph: { spacing: { line: 276, after: 120 } }             // 1.15, 6pt after
         },
         {
-          id: "TitleName",
-          name: "TitleName",
-          run: { font: "Calibri", size: 32, bold: true },
-          paragraph: { spacing: { after: 200 } },
+          id: "Name",
+          name: "Name",
+          basedOn: "Body",
+          run: { size: 36, bold: true, color: BLUE },                    // 18pt
+          paragraph: { spacing: { after: 200 } }
         },
         {
-          id: "SectionHeading",
-          name: "SectionHeading",
-          run: { font: "Calibri", size: 24, bold: true },
-          paragraph: { spacing: { before: 200, after: 100 } },
+          id: "Role",
+          name: "Role",
+          basedOn: "Body",
+          run: { size: 24, bold: true, color: BODY },                    // 12pt
+          paragraph: { spacing: { after: 160 } }
+        },
+        {
+          id: "Section",
+          name: "Section",
+          basedOn: "Body",
+          run: { bold: true, color: BLUE, size: 26 },                    // ~13pt
+          paragraph: { spacing: { before: 320, after: 100 } }            // clear section dividers
         },
         {
           id: "JobHeading",
           name: "JobHeading",
-          run: { font: "Calibri", size: 22, bold: true },
-          paragraph: { spacing: { after: 40 } },
+          basedOn: "Body",
+          run: { bold: true, color: BODY, size: 24 },                    // 12pt
+          paragraph: { spacing: { after: 40 } }
         },
         {
           id: "Meta",
           name: "Meta",
-          run: { color: "666666", size: 20 },
-          paragraph: { spacing: { after: 80 } },
+          basedOn: "Body",
+          run: { color: META, size: 18 },                                // 9pt
+          paragraph: { spacing: { after: 80 } }
         },
-      ],
+        {
+          id: "Bullet",
+          name: "Bullet",
+          basedOn: "Body",
+          run: { color: BODY, size: 22 },
+          paragraph: { spacing: { line: 276, after: 80 } }               // comfy bullets
+        }
+      ]
     },
     sections: [{
       properties: {
-        page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } },
+        page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } } // 0.5"
       },
       children: [
-        new Paragraph({ text: fullName, style: "TitleName" }),
+        // Name + contact + role
+        new Paragraph({ text: (fullName || "").trim(), style: "Name" }),
         new Paragraph({
           text: [email, phone, location].filter(Boolean).join(" | "),
-          style: "Meta",
+          style: "Meta"
         }),
-        role ? new Paragraph({ text: role, style: "NormalPara" }) : new Paragraph({ text: "" }),
+        role ? new Paragraph({ text: role, style: "Role" }) : new Paragraph({ text: "" }),
 
+        // Summary
         ...(summary ? [
-          new Paragraph({ text: "Summary", style: "SectionHeading" }),
-          new Paragraph({ text: summary, style: "NormalPara" }),
+          new Paragraph({ text: "Summary", style: "Section" }),
+          new Paragraph({ text: summary, style: "Body" })
         ] : []),
 
+        // Skills (comma-separated line = ATS-safe)
         ...(skills?.length ? [
-          new Paragraph({ text: "Skills", style: "SectionHeading" }),
-          ...skills.map(s => new Paragraph({ text: s, bullet: { level: 0 } })),
+          new Paragraph({ text: "Skills", style: "Section" }),
+          new Paragraph({ text: skills.join(", "), style: "Body" })
         ] : []),
 
-        ...(experience?.length ? [
-          new Paragraph({ text: "Experience", style: "SectionHeading" }),
+        // Experience
+        ...(Array.isArray(experience) && experience.length ? [
+          new Paragraph({ text: "Experience", style: "Section" }),
           ...experience.flatMap(job => {
             const header = [job.title, job.company].filter(Boolean).join(" — ");
-            const dates = [job.start, job.end].filter(Boolean).join(" – ");
-            return [
-              new Paragraph({ text: header, style: "JobHeading" }),
-              dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
-              ...(Array.isArray(job.bullets) ? job.bullets.map(b =>
-                new Paragraph({ text: b, bullet: { level: 0 } })
-              ) : []),
-              new Paragraph({ text: "" }),
+            const dates  = [job.start, job.end].filter(Boolean).join(" – ");
+            const lines = [
+              header ? new Paragraph({ text: header, style: "JobHeading" }) : null,
+              dates  ? new Paragraph({ text: dates,  style: "Meta" })        : null
             ].filter(Boolean);
-          }),
+
+            // Bullets
+            (Array.isArray(job.bullets) ? job.bullets : []).forEach(b =>
+              lines.push(new Paragraph({ text: b, style: "Bullet", bullet: { level: 0 } }))
+            );
+
+            // small spacer after each job
+            lines.push(new Paragraph({ text: "" }));
+            return lines;
+          })
         ] : []),
 
-        ...(education?.length ? [
-          new Paragraph({ text: "Education", style: "SectionHeading" }),
+        // Education
+        ...(Array.isArray(education) && education.length ? [
+          new Paragraph({ text: "Education", style: "Section" }),
           ...education.flatMap(ed => {
             const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
-            const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
-            return [
-              new Paragraph({ text: header, style: "JobHeading" }),
-              dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
-              new Paragraph({ text: "" }),
-            ].filter(Boolean);
-          }),
-        ] : []),
-      ],
-    }],
+            const dates  = [ed.start, ed.end].filter(Boolean).join(" – ");
+            const lines = [
+              header ? new Paragraph({ text: header, style: "JobHeading" }) : null,
+              dates  ? new Paragraph({ text: dates,  style: "Meta" })        : null,
+              new Paragraph({ text: "" })
+            ];
+            return lines.filter(Boolean);
+          })
+        ] : [])
+      ]
+    }]
   });
 
   return Packer.toBuffer(doc);
