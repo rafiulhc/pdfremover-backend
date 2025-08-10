@@ -230,8 +230,11 @@ app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
     const inputs = req.body || {};
     const ticket = (randomUUID ? randomUUID() : String(Date.now()+Math.random())).replace(/-/g,"");
     resumeTickets.set(ticket, { paid: false, createdAt: Date.now(), inputs });
-
-    const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK)}?wanted=true&fields[ticket]=${encodeURIComponent(ticket)}`;
+    // const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}`;
+    const buyUrl =
+    `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK || GUMROAD_PRODUCT_PERMALINK)}` +
+    `?wanted=true&ticket=${encodeURIComponent(ticket)}` +
+    `&fields[ticket]=${encodeURIComponent(ticket)}`;
     console.log("RESUME PREPARE", { ticket, buyUrl });
     return res.json({ ticket, buyUrl });
   } catch (e) {
@@ -937,23 +940,14 @@ app.get("/api/pro/download", async (req, res) => {
   }
 });
 
-// Parse Gumroad webhook as urlencoded (keep only once!)
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 
 app.post("/api/gumroad/ping", (req, res) => {
   try {
     const { product_permalink, price, refunded, url_params, custom_fields } = req.body;
-
     const slug = (product_permalink || "").split("/").pop();
-    const isPdfDocx = slug === GUMROAD_PRODUCT_PERMALINK;          // e.g. "ubtedo"
-    const isResume  = slug === GUMROAD_RESUME_PERMALINK;            // e.g. "ai-resume"
 
-    if (!isPdfDocx && !isResume) {
-      console.log("PING: wrong product", { slug, expected: [GUMROAD_PRODUCT_PERMALINK, GUMROAD_RESUME_PERMALINK] });
-      return res.status(400).send("Wrong product");
-    }
-
-    // PPP-friendly: any positive price
+    // Accept PPP: any positive amount
     const cents = parseInt(price || "0", 10);
     if (!Number.isFinite(cents) || cents < 1) {
       console.log("PING: no/zero price", { cents });
@@ -965,7 +959,7 @@ app.post("/api/gumroad/ping", (req, res) => {
       return res.status(200).send("Ignored (refunded)");
     }
 
-    // Find ticket in all the usual places
+    // Extract ticket from all places Gumroad might send it
     let ticket;
     if (!ticket && url_params) {
       if (typeof url_params === "string") {
@@ -984,22 +978,42 @@ app.post("/api/gumroad/ping", (req, res) => {
       ticket = req.body.ticket;
     }
 
-    // Use the correct map
-    const map = isResume ? resumeTickets : tickets;
-    if (!ticket || !map.has(ticket)) {
-      console.log("PING: no matching ticket", { ticket, product: slug });
+    // Debug: what do we have when this ping arrives?
+    console.log("PING incoming", {
+      product: slug,
+      ticket,
+      ticketsSize: tickets.size,
+      resumeTicketsSize: resumeTickets.size
+    });
+
+    if (!ticket) {
+      console.log("PING: missing ticket entirely");
       return res.status(200).send("No matching ticket");
     }
 
-    const rec = map.get(ticket);
-    rec.paid = true;
-    console.log("PING: OK (paid)", { ticket, cents, product: slug });
-    return res.status(200).send("OK");
+    // Try resume first, then pro
+    let rec = resumeTickets.get(ticket);
+    if (rec) {
+      rec.paid = true;
+      console.log("PING: OK (paid) RESUME", { ticket, cents, product: slug });
+      return res.status(200).send("OK");
+    }
+
+    rec = tickets.get(ticket);
+    if (rec) {
+      rec.paid = true;
+      console.log("PING: OK (paid) PDFPRO", { ticket, cents, product: slug });
+      return res.status(200).send("OK");
+    }
+
+    console.log("PING: no matching ticket", { ticket, product: slug });
+    return res.status(200).send("No matching ticket");
   } catch (e) {
     console.error("gumroad/ping error:", e);
     return res.status(500).send("Ping handler error");
   }
 });
+
 
 
 
