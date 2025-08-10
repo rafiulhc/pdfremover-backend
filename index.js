@@ -24,7 +24,7 @@ resumeTickets.set(ticketId, {
 });
 */
 
-const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "nktxk";
+const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "ubtedo";
 
 
 // ==== CloudConvert + helpers ====
