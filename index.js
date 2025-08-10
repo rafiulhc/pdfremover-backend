@@ -31,7 +31,7 @@ const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME ||
 // ==== CloudConvert + helpers ====
 const CloudConvert = require("cloudconvert");
 const axios = require("axios");
-const { randomUUID } = require("crypto");
+
 
 const cloudConvert = new CloudConvert(process.env.CLOUDCONVERT_API_KEY || "");
 const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "ubtedo";
