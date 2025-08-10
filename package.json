@@ -16,6 +16,7 @@
     "child_process": "^1.0.2",
     "cloudconvert": "^3.0.0",
     "cors": "^2.8.5",
+    "docx": "^9.5.1",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "form-data": "^4.0.4",
@@ -23,6 +24,7 @@
     "ioredis": "^5.7.0",
     "multer": "^2.0.2",
     "nanoid": "^5.1.5",
+    "openai": "^5.12.2",
     "pdf-lib": "^1.17.1",
     "sharp": "^0.34.3",
     "uuid": "^11.1.0"

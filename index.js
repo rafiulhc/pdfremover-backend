@@ -10,6 +10,22 @@ const app = express();
 const archiver = require("archiver");
 const { mkdtempSync, rmSync } = require("fs");
 const os = require("os");
+const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require("docx");
+const { OpenAI } = require("openai");
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
+// ==== Resume tickets ====
+const resumeTickets = new Map();
+/*
+resumeTickets.set(ticketId, {
+  paid: false,
+  createdAt: number,
+  inputs: {...}    // user form data
+});
+*/
+
+const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "ai-resume";
+
 
 // ==== CloudConvert + helpers ====
 const CloudConvert = require("cloudconvert");
@@ -37,6 +53,15 @@ setInterval(() => {
     }
   }
 }, 30 * 60 * 1000); // every 30 minutes
+
+// Clean old resume tickets (2h TTL)
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, rec] of resumeTickets) {
+    if (now - rec.createdAt > 2 * 60 * 60 * 1000) resumeTickets.delete(t);
+  }
+}, 30 * 60 * 1000);
+
 // ---------- basics ----------
 app.use(cors({
   origin: [
@@ -49,8 +74,226 @@ app.use(cors({
   allowedHeaders: ["Content-Type"]
 }));
 
-// Only parse Gumroad webhook as urlencoded
-app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
+function buildATSResumeDocx(data) {
+  const {
+    fullName = "",
+    email = "",
+    phone = "",
+    location = "",
+    role = "",
+    summary = "",
+    skills = [],
+    experience = [], // [{company, title, start, end, bullets:[]}]
+    education = [],  // [{school, degree, start, end}]
+  } = data;
+
+  const doc = new Document({
+    sections: [{
+      properties: {},
+      children: [
+        new Paragraph({ text: fullName, heading: HeadingLevel.TITLE }),
+        new Paragraph({ text: [email, phone, location].filter(Boolean).join(" | ") }),
+        role ? new Paragraph({ text: role, spacing: { after: 160 } }) : new Paragraph({ text: "" }),
+
+        ...(summary ? [
+          new Paragraph({ text: "Summary", heading: HeadingLevel.HEADING_1 }),
+          new Paragraph({ text: summary, spacing: { after: 160 } }),
+        ] : []),
+
+        ...(skills?.length ? [
+          new Paragraph({ text: "Skills", heading: HeadingLevel.HEADING_1 }),
+          new Paragraph({ text: skills.join(", "), spacing: { after: 160 } }),
+        ] : []),
+
+        ...(experience?.length ? [
+          new Paragraph({ text: "Experience", heading: HeadingLevel.HEADING_1 }),
+          ...experience.flatMap((job) => {
+            const lines = [];
+            const header = [job.title, job.company].filter(Boolean).join(" — ");
+            const dates = [job.start, job.end].filter(Boolean).join(" – ");
+            lines.push(new Paragraph({ text: header, heading: HeadingLevel.HEADING_2 }));
+            if (dates) lines.push(new Paragraph({ text: dates }));
+            (job.bullets || []).forEach(b => {
+              lines.push(new Paragraph({
+                children: [new TextRun({ text: "• " + b })],
+              }));
+            });
+            lines.push(new Paragraph({ text: "", spacing: { after: 120 } }));
+            return lines;
+          }),
+        ] : []),
+
+        ...(education?.length ? [
+          new Paragraph({ text: "Education", heading: HeadingLevel.HEADING_1 }),
+          ...education.flatMap((ed) => {
+            const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
+            const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
+            return [
+              new Paragraph({ text: header, heading: HeadingLevel.HEADING_2 }),
+              dates ? new Paragraph({ text: dates }) : new Paragraph({ text: "" }),
+              new Paragraph({ text: "", spacing: { after: 120 } }),
+            ];
+          }),
+        ] : []),
+      ],
+    }],
+  });
+
+  return Packer.toBuffer(doc);
+}
+
+
+function previewPrompt(inputs) {
+  const { role = "", skills = "", experienceText = "" } = inputs;
+  return `You are a professional resume writer. Create a SHORT preview (5-7 bullet points) of an ATS-friendly resume for the following candidate.
+
+Role target: ${role}
+Key skills: ${skills}
+Experience summary (raw text): ${experienceText}
+
+Rules:
+- Output plain text bullets only.
+- No tables, no fancy formatting.
+- Focus on quantified, impact-oriented bullets.
+- Keep to 5-7 lines.`;
+}
+
+function fullJsonPrompt(inputs) {
+  const { fullName="", email="", phone="", location="", role="", yearsExp="", skills="", achievements="", experienceText="", educationText="" } = inputs;
+  return `You are an expert resume writer. Produce a clean JSON (and ONLY JSON) for an ATS-friendly resume.
+
+Candidate:
+- Name: ${fullName}
+- Email: ${email}
+- Phone: ${phone}
+- Location: ${location}
+- Target role: ${role}
+- Years experience: ${yearsExp}
+- Key skills (comma-separated): ${skills}
+- Achievements (raw text): ${achievements}
+- Experience (raw text): ${experienceText}
+- Education (raw text): ${educationText}
+
+Return strictly this JSON schema:
+{
+  "summary": "1 short paragraph",
+  "skills": ["Skill A", "Skill B", "..."],
+  "experience": [
+    { "company": "", "title": "", "start": "", "end": "", "bullets": ["...", "..."] }
+  ],
+  "education": [
+    { "school": "", "degree": "", "start": "", "end": "" }
+  ]
+}
+
+Rules:
+- Keep it factual and ATS-friendly. No tables.
+- Convert raw text into clean bullets with strong action verbs and numbers where implied.
+- If dates are unknown, leave empty strings.
+- Only output JSON.`;
+}
+
+app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
+  try {
+    if (!openai) return res.status(500).json({ error: "AI not configured" });
+    const inputs = req.body || {};
+    const prompt = previewPrompt(inputs);
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      max_tokens: 250,
+    });
+    const text = resp.choices?.[0]?.message?.content?.trim() || "";
+    return res.json({ preview: text });
+  } catch (e) {
+    console.error("resume preview error:", e);
+    return res.status(500).json({ error: "Failed to build preview" });
+  }
+});
+
+
+app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
+  try {
+    const inputs = req.body || {};
+    const ticket = (randomUUID ? randomUUID() : String(Date.now()+Math.random())).replace(/-/g,"");
+    resumeTickets.set(ticket, { paid: false, createdAt: Date.now(), inputs });
+
+    const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK)}?wanted=true&fields[ticket]=${encodeURIComponent(ticket)}`;
+    console.log("RESUME PREPARE", { ticket, buyUrl });
+    return res.json({ ticket, buyUrl });
+  } catch (e) {
+    console.error("resume prepare error:", e);
+    return res.status(500).json({ error: "Failed to init resume purchase" });
+  }
+});
+
+app.get("/api/ai/resume/status", (req, res) => {
+  const ticket = String(req.query.ticket || "");
+  const rec = resumeTickets.get(ticket);
+  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+
+  // no-cache
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma", "no-cache");
+  res.set("Expires", "0");
+  res.set("Surrogate-Control", "no-store");
+
+  res.json({ paid: rec.paid });
+});
+
+
+app.get("/api/ai/resume/download", async (req, res) => {
+  try {
+    const ticket = String(req.query.ticket || "");
+    const rec = resumeTickets.get(ticket);
+    if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+    if (!rec.paid) return res.status(402).json({ error: "Payment required" });
+    if (!openai) return res.status(500).json({ error: "AI not configured" });
+
+    // Ask OpenAI for structured JSON
+    const prompt = fullJsonPrompt(rec.inputs);
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      max_tokens: 900,
+      response_format: { type: "json_object" }
+    });
+
+    let json;
+    try {
+      json = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
+    } catch {
+      // fallback: try to salvage JSON
+      const raw = resp.choices?.[0]?.message?.content || "{}";
+      json = (() => { try { return JSON.parse(raw.replace(/```json|```/g,"")); } catch { return {}; }})();
+    }
+
+    // Build DOCX
+    const buf = await buildATSResumeDocx({
+      fullName: rec.inputs.fullName,
+      email: rec.inputs.email,
+      phone: rec.inputs.phone,
+      location: rec.inputs.location,
+      role: rec.inputs.role,
+      summary: json.summary || "",
+      skills: Array.isArray(json.skills) ? json.skills : String(rec.inputs.skills||"").split(",").map(s=>s.trim()).filter(Boolean),
+      experience: Array.isArray(json.experience) ? json.experience : [],
+      education: Array.isArray(json.education) ? json.education : [],
+    });
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    res.setHeader("Content-Disposition", `attachment; filename="resume.docx"`);
+    return res.send(buf);
+  } catch (e) {
+    console.error("resume download error:", e);
+    return res.status(500).json({ error: "Failed to generate resume" });
+  }
+});
+
+
+
 
 const OUTDIR = path.join(process.cwd(), "uploads");
 fs.mkdirSync(OUTDIR, { recursive: true });
@@ -675,69 +918,62 @@ app.get("/api/pro/download", async (req, res) => {
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 app.post("/api/gumroad/ping", (req, res) => {
   try {
-    const { product_permalink, price, refunded, url_params, custom_fields } = req.body;
+    const { product_permalink, price, refunded, url_params } = req.body;
 
-    // product slug check
-    const slug = (product_permalink || "").split("/").pop();
-    if (slug !== GUMROAD_PRODUCT_PERMALINK) {
-      console.log("PING: wrong product", { slug, expected: GUMROAD_PRODUCT_PERMALINK });
-      return res.status(400).send("Wrong product");
+    // normalize url_params to an object
+    let params = {};
+    if (typeof url_params === "string") {
+      try { params = JSON.parse(url_params); } catch { params = {}; }
+    } else if (typeof url_params === "object" && url_params) {
+      params = url_params;
     }
-
-    // PPP-friendly: accept any positive payment
-    const cents = parseInt(price || "0", 10);
-    if (!Number.isFinite(cents) || cents < 1) {
-      console.log("PING: no/zero price", { cents });
-      return res.status(400).send("No payment amount");
-    }
+    const ticket = params.ticket;
 
     // ignore refunds
     if (String(refunded || "").toLowerCase() === "true") {
-      console.log("PING: refunded");
+      console.log("PING: refunded - ignoring", { ticket });
       return res.status(200).send("Ignored (refunded)");
     }
 
-    // --- find ticket in multiple possible places ---
-    let ticket = undefined;
+    const cents = parseInt(price || "0", 10);
+    if (!Number.isFinite(cents) || cents <= 0) {
+      console.log("PING: underpaid/invalid", { cents });
+      return res.status(400).send("Invalid/underpaid");
+    }
 
-    // 1) url_params.ticket (works when you use ?ticket=... in the checkout URL)
-    if (!ticket && url_params) {
-      if (typeof url_params === "string") {
-        try { ticket = JSON.parse(url_params).ticket; } catch {}
-      } else if (typeof url_params === "object") {
-        ticket = url_params.ticket || url_params.TICKET;
+    // Identify which product this ping is for
+    const permalink = (product_permalink || "").split("/").pop();
+
+    if (permalink === (process.env.GUMROAD_PRODUCT_PERMALINK || "pdf2docx-pro")) {
+      if (!ticket || !tickets.has(ticket)) {
+        console.log("PING: no matching ticket (pdf2docx-pro)", { ticket });
+        return res.status(200).send("No matching ticket");
       }
+      const rec = tickets.get(ticket);
+      rec.paid = true;
+      console.log("PING: OK (pdf2docx-pro, paid)", { ticket, cents });
+      return res.status(200).send("OK");
     }
 
-    // 2) custom_fields.ticket (when you use a custom field named "ticket")
-    if (!ticket && custom_fields && typeof custom_fields === "object") {
-      ticket = custom_fields.ticket || custom_fields.TICKET;
+    if (permalink === (process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "ai-resume")) {
+      if (!ticket || !resumeTickets.has(ticket)) {
+        console.log("PING: no matching ticket (ai-resume)", { ticket });
+        return res.status(200).send("No matching ticket");
+      }
+      const rec = resumeTickets.get(ticket);
+      rec.paid = true;
+      console.log("PING: OK (ai-resume, paid)", { ticket, cents });
+      return res.status(200).send("OK");
     }
 
-    // 3) fields[ticket] (how Gumroad posts ad-hoc fields)
-    if (!ticket && typeof req.body["fields[ticket]"] === "string") {
-      ticket = req.body["fields[ticket]"];
-    }
-
-    // 4) bare 'ticket' just in case
-    if (!ticket && typeof req.body.ticket === "string") {
-      ticket = req.body.ticket;
-    }
-
-    if (!ticket || !tickets.has(ticket)) {
-      console.log("PING: no matching ticket", { ticket });
-      return res.status(200).send("No matching ticket");
-    }
-
-    const rec = tickets.get(ticket);
-    rec.paid = true;
-    console.log("PING: OK (paid)", { ticket, cents });
-    return res.status(200).send("OK");
+    console.log("PING: wrong/unknown product", { permalink });
+    return res.status(400).send("Wrong product");
   } catch (e) {
     console.error("gumroad/ping error:", e);
     return res.status(500).send("Ping handler error");
   }
 });
+
 
 
 
