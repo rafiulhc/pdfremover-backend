@@ -262,24 +262,24 @@ Rules:
 - Only output JSON.`;
 }
 
-app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
-  try {
-    if (!openai) return res.status(500).json({ error: "AI not configured" });
-    const inputs = req.body || {};
-    const prompt = previewPrompt(inputs);
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-      max_tokens: 250,
-    });
-    const text = resp.choices?.[0]?.message?.content?.trim() || "";
-    return res.json({ preview: text });
-  } catch (e) {
-    console.error("resume preview error:", e);
-    return res.status(500).json({ error: "Failed to build preview" });
-  }
-});
+// app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
+//   try {
+//     if (!openai) return res.status(500).json({ error: "AI not configured" });
+//     const inputs = req.body || {};
+//     const prompt = previewPrompt(inputs);
+//     const resp = await openai.chat.completions.create({
+//       model: "gpt-4o-mini",
+//       messages: [{ role: "user", content: prompt }],
+//       temperature: 0.3,
+//       max_tokens: 250,
+//     });
+//     const text = resp.choices?.[0]?.message?.content?.trim() || "";
+//     return res.json({ preview: text });
+//   } catch (e) {
+//     console.error("resume preview error:", e);
+//     return res.status(500).json({ error: "Failed to build preview" });
+//   }
+// });
 
 
 app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
