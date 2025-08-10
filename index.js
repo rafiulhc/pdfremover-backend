@@ -65,6 +65,63 @@ app.use(cors({
   allowedHeaders: ["Content-Type"]
 }));
 
+function buildResumeHTML({ fullName, email, phone, location, role, summary, skills = [], experience = [], education = [] }) {
+  const esc = (s="") => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const list = (arr=[]) => arr.map(x => `<li>${esc(x)}</li>`).join("");
+
+  return `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>Resume Preview</title>
+<style>
+  body{margin:0;background:#eef2f7;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  .page{width:800px;aspect-ratio:1 / 1.4142;background:#fff;margin:24px auto;padding:48px;
+        box-shadow:0 20px 60px rgba(0,0,0,.15);box-sizing:border-box}
+  h1{margin:0 0 4px 0;font-size:28px}
+  .sub{color:#334155;margin:2px 0 12px 0}
+  h2{font-size:16px;margin:18px 0 8px 0;border-bottom:1px solid #e5e7eb;padding-bottom:6px}
+  ul{margin:0;padding-left:18px}
+  li{margin:6px 0;line-height:1.45}
+  .row{display:flex;gap:8px;flex-wrap:wrap;color:#334155}
+  .job{margin:8px 0}
+  .job h3{margin:0 0 2px 0;font-size:15px}
+  .dates{color:#64748b;font-size:12px;margin-bottom:4px}
+  @media (max-width:860px){.page{width:min(92vw,800px);padding:clamp(20px,4vw,48px)}}
+</style>
+<body>
+  <div class="page">
+    <h1>${esc(fullName || "")}</h1>
+    <div class="sub">${[email, phone, location].filter(Boolean).map(esc).join(" • ")}</div>
+    ${role ? `<div class="sub"><strong>${esc(role)}</strong></div>` : ""}
+
+    ${summary ? `<h2>Summary</h2><p>${esc(summary)}</p>` : ""}
+
+    ${skills.length ? `<h2>Skills</h2><div class="row">${skills.map(s=>`<span>${esc(s)}</span>`).join(" • ")}</div>` : ""}
+
+    ${experience.length ? `<h2>Experience</h2>
+      ${experience.map(j => `
+        <div class="job">
+          <h3>${esc([j.title, j.company].filter(Boolean).join(" — "))}</h3>
+          <div class="dates">${esc([j.start, j.end].filter(Boolean).join(" – "))}</div>
+          ${j.bullets?.length ? `<ul>${list(j.bullets)}</ul>` : ""}
+        </div>
+      `).join("")}
+    ` : ""}
+
+    ${education.length ? `<h2>Education</h2>
+      ${education.map(ed => `
+        <div class="job">
+          <h3>${esc([ed.degree, ed.school].filter(Boolean).join(" — "))}</h3>
+          <div class="dates">${esc([ed.start, ed.end].filter(Boolean).join(" – "))}</div>
+        </div>
+      `).join("")}
+    ` : ""}
+  </div>
+</body></html>`;
+}
+
+
 function buildATSResumeDocx(data) {
   const {
     fullName = "",
@@ -229,12 +286,12 @@ app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
   try {
     const inputs = req.body || {};
     const ticket = (randomUUID ? randomUUID() : String(Date.now()+Math.random())).replace(/-/g,"");
-    resumeTickets.set(ticket, { paid: false, createdAt: Date.now(), inputs });
-    // const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}`;
-    const buyUrl =
-    `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK)}` +
-    `?wanted=true&ticket=${encodeURIComponent(ticket)}` +
-    `&fields[ticket]=${encodeURIComponent(ticket)}`;
+    resumeTickets.set(ticket, {
+      paid: false,
+      createdAt: Date.now(),
+      inputs,                 // includes previewJson if provided
+    });
+    const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK || GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}&fields[ticket]=${encodeURIComponent(ticket)}`;
     console.log("RESUME PREPARE", { ticket, buyUrl });
     return res.json({ ticket, buyUrl });
   } catch (e) {
@@ -242,6 +299,8 @@ app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
     return res.status(500).json({ error: "Failed to init resume purchase" });
   }
 });
+
+
 
 app.get("/api/ai/resume/status", async (req, res) => {
   const ticket = String(req.query.ticket || "");
@@ -276,26 +335,21 @@ app.get("/api/ai/resume/download", async (req, res) => {
     if (!rec.paid) return res.status(402).json({ error: "Payment required" });
     if (!openai) return res.status(500).json({ error: "AI not configured" });
 
-    // Ask OpenAI for structured JSON
-    const prompt = fullJsonPrompt(rec.inputs);
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-      max_tokens: 900,
-      response_format: { type: "json_object" }
-    });
-
-    let json;
-    try {
+    // If we already have preview JSON, reuse it (no regeneration)
+    let json = rec?.inputs?.previewJson;
+    if (!json) {
+      // fallback (should be rare)
+      const prompt = fullJsonPrompt(rec.inputs || {});
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+        max_tokens: 900,
+        response_format: { type: "json_object" }
+      });
       json = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
-    } catch {
-      // fallback: try to salvage JSON
-      const raw = resp.choices?.[0]?.message?.content || "{}";
-      json = (() => { try { return JSON.parse(raw.replace(/```json|```/g,"")); } catch { return {}; }})();
     }
 
-    // Build DOCX
     const buf = await buildATSResumeDocx({
       fullName: rec.inputs.fullName,
       email: rec.inputs.email,
@@ -303,7 +357,7 @@ app.get("/api/ai/resume/download", async (req, res) => {
       location: rec.inputs.location,
       role: rec.inputs.role,
       summary: json.summary || "",
-      skills: Array.isArray(json.skills) ? json.skills : String(rec.inputs.skills||"").split(",").map(s=>s.trim()).filter(Boolean),
+      skills: Array.isArray(json.skills) ? json.skills : [],
       experience: Array.isArray(json.experience) ? json.experience : [],
       education: Array.isArray(json.education) ? json.education : [],
     });
@@ -1014,6 +1068,48 @@ app.post("/api/gumroad/ping", (req, res) => {
   }
 });
 
+app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
+  try {
+    if (!openai) return res.status(500).json({ error: "AI not configured" });
+    const inputs = req.body || {};
+    // build full JSON once here (same as download)
+    const prompt = fullJsonPrompt(inputs);
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      max_tokens: 900,
+      response_format: { type: "json_object" }
+    });
+
+    let json = {};
+    try { json = JSON.parse(resp.choices?.[0]?.message?.content || "{}"); }
+    catch { /* best-effort salvage */ }
+
+    // fallback skills if model returns none
+    if (!Array.isArray(json.skills)) {
+      json.skills = String(inputs.skills || "")
+        .split(",").map(s=>s.trim()).filter(Boolean);
+    }
+
+    const html = buildResumeHTML({
+      fullName: inputs.fullName,
+      email: inputs.email,
+      phone: inputs.phone,
+      location: inputs.location,
+      role: inputs.role,
+      summary: json.summary || "",
+      skills: json.skills || [],
+      experience: Array.isArray(json.experience) ? json.experience : [],
+      education: Array.isArray(json.education) ? json.education : [],
+    });
+
+    return res.json({ json, html });
+  } catch (e) {
+    console.error("resume preview error:", e);
+    return res.status(500).json({ error: "Failed to build preview" });
+  }
+});
 
 
 
