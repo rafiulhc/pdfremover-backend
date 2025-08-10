@@ -13,7 +13,8 @@ const os = require("os");
 const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require("docx");
 const { OpenAI } = require("openai");
 const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-
+const aiResume = new Map();
+const { randomUUID } = require("crypto");
 // ==== Resume tickets ====
 const resumeTickets = new Map();
 /*
@@ -193,107 +194,117 @@ Rules:
 - Only output JSON.`;
 }
 
-app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
-  try {
-    if (!openai) return res.status(500).json({ error: "AI not configured" });
-    const inputs = req.body || {};
-    const prompt = previewPrompt(inputs);
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-      max_tokens: 250,
-    });
-    const text = resp.choices?.[0]?.message?.content?.trim() || "";
-    return res.json({ preview: text });
-  } catch (e) {
-    console.error("resume preview error:", e);
-    return res.status(500).json({ error: "Failed to build preview" });
+app.get("/api/ai/resume/preview", (req, res) => {
+  const ticket = String(req.query.ticket || "");
+  const rec = aiResume.get(ticket);
+  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+  if (rec.stage !== "preview_ready" && rec.stage !== "final_ready") {
+    return res.status(425).json({ error: "Preview not ready" });
   }
+  res.json({ preview: rec.preview });
 });
 
 
-app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
-  try {
-    const inputs = req.body || {};
-    const ticket = (randomUUID ? randomUUID() : String(Date.now()+Math.random())).replace(/-/g,"");
-    resumeTickets.set(ticket, { paid: false, createdAt: Date.now(), inputs });
 
-    const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK)}?wanted=true&fields[ticket]=${encodeURIComponent(ticket)}`;
-    console.log("RESUME PREPARE", { ticket, buyUrl });
-    return res.json({ ticket, buyUrl });
-  } catch (e) {
-    console.error("resume prepare error:", e);
-    return res.status(500).json({ error: "Failed to init resume purchase" });
+app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
+  const ticket = randomUUID().replace(/-/g, "");
+  const { prompt } = req.body || {};
+  if (!prompt || typeof prompt !== "string") {
+    return res.status(400).json({ error: "Missing prompt" });
   }
+
+  aiResume.set(ticket, {
+    stage: "init",
+    preview: "",
+    paid: true,            // set true if you are NOT charging for resume; set false if you will
+    filePath: null,
+    createdAt: Date.now(),
+    error: null
+  });
+
+  // fire-and-forget preview
+  (async () => {
+    try {
+      // TODO: replace with real OpenAI call; keep it fast/cheap
+      // const out = await openai.responses.create({ ... });
+      // const text = out.output_text.trim().slice(0, 900);
+      const text = `• ${prompt.slice(0, 200)} ...`; // placeholder generation
+
+      const rec = aiResume.get(ticket);
+      if (!rec) return;
+      rec.preview = text;
+      rec.stage = "preview_ready";
+    } catch (e) {
+      const rec = aiResume.get(ticket);
+      if (rec) { rec.stage = "error"; rec.error = e.message || "Preview failed"; }
+    }
+  })();
+
+  res.json({ ticket });
 });
 
 app.get("/api/ai/resume/status", (req, res) => {
   const ticket = String(req.query.ticket || "");
-  const rec = resumeTickets.get(ticket);
+  const rec = aiResume.get(ticket);
   if (!rec) return res.status(404).json({ error: "Invalid ticket" });
 
-  // no-cache
-  res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.set("Pragma", "no-cache");
-  res.set("Expires", "0");
-  res.set("Surrogate-Control", "no-store");
+  // never cache
+  res.set("Cache-Control","no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.set("Pragma","no-cache"); res.set("Expires","0"); res.set("Surrogate-Control","no-store");
 
-  res.json({ paid: rec.paid });
+  res.json({
+    stage: rec.stage,             // "init" | "preview_ready" | "final_ready" | "error"
+    previewReady: rec.stage === "preview_ready" || rec.stage === "final_ready",
+    docReady: rec.stage === "final_ready",
+    paid: !!rec.paid,
+    error: rec.error
+  });
 });
 
+app.post("/api/ai/resume/confirm", express.json(), async (req, res) => {
+  const ticket = String(req.body?.ticket || "");
+  const rec = aiResume.get(ticket);
+  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+  if (rec.stage !== "preview_ready") return res.status(400).json({ error: "Preview not ready" });
 
-app.get("/api/ai/resume/download", async (req, res) => {
-  try {
-    const ticket = String(req.query.ticket || "");
-    const rec = resumeTickets.get(ticket);
-    if (!rec) return res.status(404).json({ error: "Invalid ticket" });
-    if (!rec.paid) return res.status(402).json({ error: "Payment required" });
-    if (!openai) return res.status(500).json({ error: "AI not configured" });
+  // If you charge for resumes, check rec.paid here (set by your Gumroad ping):
+  // if (!rec.paid) return res.status(402).json({ error: "Payment required" });
 
-    // Ask OpenAI for structured JSON
-    const prompt = fullJsonPrompt(rec.inputs);
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-      max_tokens: 900,
-      response_format: { type: "json_object" }
-    });
-
-    let json;
+  (async () => {
     try {
-      json = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
-    } catch {
-      // fallback: try to salvage JSON
-      const raw = resp.choices?.[0]?.message?.content || "{}";
-      json = (() => { try { return JSON.parse(raw.replace(/```json|```/g,"")); } catch { return {}; }})();
+      const lines = rec.preview.split("\n").map(l => new Paragraph(new TextRun(l)));
+      const doc = new Document({ sections: [{ properties: {}, children: lines }] });
+      const buf = await Packer.toBuffer(doc);
+
+      const outPath = path.join(OUTDIR, `resume-${ticket}.docx`);
+      fs.writeFileSync(outPath, buf);
+      rec.filePath = outPath;
+      rec.stage = "final_ready";
+    } catch (e) {
+      rec.stage = "error"; rec.error = e.message || "Render failed";
     }
+  })();
 
-    // Build DOCX
-    const buf = await buildATSResumeDocx({
-      fullName: rec.inputs.fullName,
-      email: rec.inputs.email,
-      phone: rec.inputs.phone,
-      location: rec.inputs.location,
-      role: rec.inputs.role,
-      summary: json.summary || "",
-      skills: Array.isArray(json.skills) ? json.skills : String(rec.inputs.skills||"").split(",").map(s=>s.trim()).filter(Boolean),
-      experience: Array.isArray(json.experience) ? json.experience : [],
-      education: Array.isArray(json.education) ? json.education : [],
-    });
-
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-    res.setHeader("Content-Disposition", `attachment; filename="resume.docx"`);
-    return res.send(buf);
-  } catch (e) {
-    console.error("resume download error:", e);
-    return res.status(500).json({ error: "Failed to generate resume" });
-  }
+  res.json({ ok: true });
 });
 
 
+app.get("/api/ai/resume/download", (req, res) => {
+  const ticket = String(req.query.ticket || "");
+  const rec = aiResume.get(ticket);
+  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+  if (rec.stage !== "final_ready" || !rec.filePath || !fs.existsSync(rec.filePath)) {
+    return res.status(425).json({ error: "Not ready" });
+  }
+  res.setHeader("Content-Type",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+  res.setHeader("Content-Disposition", 'attachment; filename="resume.docx"');
+  fs.createReadStream(rec.filePath).pipe(res);
+});
 
+
+// Only parse Gumroad webhook as urlencoded
+app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 
 const OUTDIR = path.join(process.cwd(), "uploads");
 fs.mkdirSync(OUTDIR, { recursive: true });
@@ -918,62 +929,69 @@ app.get("/api/pro/download", async (req, res) => {
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 app.post("/api/gumroad/ping", (req, res) => {
   try {
-    const { product_permalink, price, refunded, url_params } = req.body;
+    const { product_permalink, price, refunded, url_params, custom_fields } = req.body;
 
-    // normalize url_params to an object
-    let params = {};
-    if (typeof url_params === "string") {
-      try { params = JSON.parse(url_params); } catch { params = {}; }
-    } else if (typeof url_params === "object" && url_params) {
-      params = url_params;
+    // product slug check
+    const slug = (product_permalink || "").split("/").pop();
+    if (slug !== GUMROAD_PRODUCT_PERMALINK) {
+      console.log("PING: wrong product", { slug, expected: GUMROAD_PRODUCT_PERMALINK });
+      return res.status(400).send("Wrong product");
     }
-    const ticket = params.ticket;
+
+    // PPP-friendly: accept any positive payment
+    const cents = parseInt(price || "0", 10);
+    if (!Number.isFinite(cents) || cents < 1) {
+      console.log("PING: no/zero price", { cents });
+      return res.status(400).send("No payment amount");
+    }
 
     // ignore refunds
     if (String(refunded || "").toLowerCase() === "true") {
-      console.log("PING: refunded - ignoring", { ticket });
+      console.log("PING: refunded");
       return res.status(200).send("Ignored (refunded)");
     }
 
-    const cents = parseInt(price || "0", 10);
-    if (!Number.isFinite(cents) || cents <= 0) {
-      console.log("PING: underpaid/invalid", { cents });
-      return res.status(400).send("Invalid/underpaid");
-    }
+    // --- find ticket in multiple possible places ---
+    let ticket = undefined;
 
-    // Identify which product this ping is for
-    const permalink = (product_permalink || "").split("/").pop();
-
-    if (permalink === (process.env.GUMROAD_PRODUCT_PERMALINK || "pdf2docx-pro")) {
-      if (!ticket || !tickets.has(ticket)) {
-        console.log("PING: no matching ticket (pdf2docx-pro)", { ticket });
-        return res.status(200).send("No matching ticket");
+    // 1) url_params.ticket (works when you use ?ticket=... in the checkout URL)
+    if (!ticket && url_params) {
+      if (typeof url_params === "string") {
+        try { ticket = JSON.parse(url_params).ticket; } catch {}
+      } else if (typeof url_params === "object") {
+        ticket = url_params.ticket || url_params.TICKET;
       }
-      const rec = tickets.get(ticket);
-      rec.paid = true;
-      console.log("PING: OK (pdf2docx-pro, paid)", { ticket, cents });
-      return res.status(200).send("OK");
     }
 
-    if (permalink === (process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "ai-resume")) {
-      if (!ticket || !resumeTickets.has(ticket)) {
-        console.log("PING: no matching ticket (ai-resume)", { ticket });
-        return res.status(200).send("No matching ticket");
-      }
-      const rec = resumeTickets.get(ticket);
-      rec.paid = true;
-      console.log("PING: OK (ai-resume, paid)", { ticket, cents });
-      return res.status(200).send("OK");
+    // 2) custom_fields.ticket (when you use a custom field named "ticket")
+    if (!ticket && custom_fields && typeof custom_fields === "object") {
+      ticket = custom_fields.ticket || custom_fields.TICKET;
     }
 
-    console.log("PING: wrong/unknown product", { permalink });
-    return res.status(400).send("Wrong product");
+    // 3) fields[ticket] (how Gumroad posts ad-hoc fields)
+    if (!ticket && typeof req.body["fields[ticket]"] === "string") {
+      ticket = req.body["fields[ticket]"];
+    }
+
+    // 4) bare 'ticket' just in case
+    if (!ticket && typeof req.body.ticket === "string") {
+      ticket = req.body.ticket;
+    }
+
+    if (!ticket || !tickets.has(ticket)) {
+      console.log("PING: no matching ticket", { ticket });
+      return res.status(200).send("No matching ticket");
+    }
+
+    const rec = tickets.get(ticket);
+    rec.paid = true;
+    console.log("PING: OK (paid)", { ticket, cents });
+    return res.status(200).send("OK");
   } catch (e) {
     console.error("gumroad/ping error:", e);
     return res.status(500).send("Ping handler error");
   }
 });
-
 
 
 
