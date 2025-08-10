@@ -24,7 +24,7 @@ resumeTickets.set(ticketId, {
 });
 */
 
-const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "ai-resume";
+const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "nktxk";
 
 
 // ==== CloudConvert + helpers ====
@@ -232,7 +232,7 @@ app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
     resumeTickets.set(ticket, { paid: false, createdAt: Date.now(), inputs });
     // const buyUrl = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}?wanted=true&ticket=${encodeURIComponent(ticket)}`;
     const buyUrl =
-    `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK || GUMROAD_PRODUCT_PERMALINK)}` +
+    `https://gumroad.com/l/${encodeURIComponent(GUMROAD_RESUME_PERMALINK)}` +
     `?wanted=true&ticket=${encodeURIComponent(ticket)}` +
     `&fields[ticket]=${encodeURIComponent(ticket)}`;
     console.log("RESUME PREPARE", { ticket, buyUrl });
