@@ -162,183 +162,377 @@ function buildResumeHTML({
 </body></html>`;
 }
 
+// function buildATSResumeDocxCompact(data) {
+//   const {
+//     fullName = "",
+//     email = "", phone = "", location = "", role = "",
+//     summary = "",
+//     skills = [],                // array
+//     areaOfExpertise = [],       // array
+//     experience = [],            // [{company,title,start,end,bullets:[]}]
+//     education = [],             // [{school,degree,start,end}]
+//     links = []                  // [{label,url}]
+//   } = data;
+
+//   // ---- TUNING KNOBS (tight & one-page-ish) ----
+//   const MAX_JOBS = 2;
+//   const MAX_BULLETS_PER_JOB = 4;
+//   const MAX_EDU = 2;
+
+//   const BLUE = "1D4ED8";     // accents (matches preview brand)
+//   const INK  = "0F172A";     // main text
+//   const META = "475569";     // light text
+
+//   // helpers
+//   const joinLine = (arr) => arr.filter(Boolean).join(" | ");
+//   const line = (t, style, opts={}) => new Paragraph({ text: t || "", style, ...opts });
+
+//   // compact content (limit items so it fits)
+//   const jobs = Array.isArray(experience) ? experience.slice(0, MAX_JOBS).map(j => ({
+//     ...j, bullets: Array.isArray(j.bullets) ? j.bullets.slice(0, MAX_BULLETS_PER_JOB) : []
+//   })) : [];
+
+//   const edus = Array.isArray(education) ? education.slice(0, MAX_EDU) : [];
+
+//   // turn list-y sections into single lines (saves space, still ATS-safe)
+//   const skillLine = (skills || []).filter(Boolean).join(", ");
+//   const expertiseLine = (areaOfExpertise || []).filter(Boolean).join(", ");
+//   const linksLine = (links || [])
+//     .filter(l => l && l.url)
+//     .map(l => (l.label ? `${l.label}: ${l.url}` : l.url))
+//     .join(" | ");
+
+//   const doc = new Document({
+//     sections: [{
+//       properties: {
+//         // A4 page, tight margins
+//         page: {
+//           size: { width: 11906, height: 16838 }, // A4 twips
+//           margin: { top: 720, right: 720, bottom: 720, left: 720 }, // 0.5"
+//         },
+//       },
+//       children: [
+//         line(fullName, "Name", { keepLines: true }),
+//         line(joinLine([email, phone, location]), "Meta"),
+//         linksLine ? line(linksLine, "Meta") : line("", "Meta"),
+//         role ? line(role, "Role") : null,
+
+//         ...(summary
+//           ? [line("Summary", "Section"), line(summary, "BodyTight")]
+//           : []),
+
+//         ...(expertiseLine
+//           ? [line("Area of Expertise", "Section"), line(expertiseLine, "BodyTight")]
+//           : []),
+
+//         ...(skillLine
+//           ? [line("Skills", "Section"), line(skillLine, "BodyTight")]
+//           : []),
+
+//         ...(jobs.length
+//           ? [
+//               line("Experience", "Section"),
+//               ...jobs.flatMap(j => {
+//                 const header = [j.title, j.company].filter(Boolean).join(" — ");
+//                 const dates  = [j.start, j.end].filter(Boolean).join(" – ");
+//                 const out = [];
+//                 if (header) out.push(line(header, "JobHeading", { keepLines: true }));
+//                 if (dates)  out.push(line(dates,  "Meta"));
+//                 (j.bullets || []).forEach(b => {
+//                   out.push(new Paragraph({
+//                     style: "Bullet",
+//                     children: [new TextRun({ text: b })],
+//                     numbering: { reference: "bul", level: 0 },
+//                     keepLines: true
+//                   }));
+//                 });
+//                 return out;
+//               })
+//             ]
+//           : []),
+
+//         ...(edus.length
+//           ? [
+//               line("Education", "Section"),
+//               ...edus.flatMap(ed => {
+//                 const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
+//                 const dates  = [ed.start, ed.end].filter(Boolean).join(" – ");
+//                 const out = [];
+//                 if (header) out.push(line(header, "JobHeading", { keepLines: true }));
+//                 if (dates)  out.push(line(dates,  "Meta"));
+//                 return out;
+//               })
+//             ]
+//           : []),
+//       ].filter(Boolean),
+//     }],
+//     styles: {
+//       paragraphStyles: [
+//         {
+//           id: "BodyTight",
+//           name: "BodyTight",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", color: INK, size: 21 }, // 10.5pt
+//           paragraph: { spacing: { line: 260, after: 60 } } // ~1.15, 3pt after
+//         },
+//         {
+//           id: "Name",
+//           name: "Name",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", color: INK, bold: true, size: 34 }, // ~17pt
+//           paragraph: { spacing: { after: 120 } }
+//         },
+//         {
+//           id: "Role",
+//           name: "Role",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", color: INK, bold: true, size: 24 },  // 12pt
+//           paragraph: { spacing: { after: 80 } }
+//         },
+//         {
+//           id: "Meta",
+//           name: "Meta",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", color: META, size: 18 }, // 9pt
+//           paragraph: { spacing: { after: 60 } }
+//         },
+//         {
+//           id: "Section",
+//           name: "Section",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", color: BLUE, bold: true, size: 22 }, // 11pt
+//           paragraph: { spacing: { before: 160, after: 60 } }
+//         },
+//         {
+//           id: "JobHeading",
+//           name: "JobHeading",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", color: INK, bold: true, size: 22 }, // 11pt
+//           paragraph: { spacing: { after: 40 } }
+//         },
+//         {
+//           id: "Bullet",
+//           name: "Bullet",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", color: INK, size: 21 },
+//           paragraph: { spacing: { line: 260, after: 40 } } // tighter bullets
+//         },
+//       ],
+//       numbering: {
+//         config: [
+//           {
+//             reference: "bul",
+//             levels: [
+//               {
+//                 level: 0,
+//                 format: "bullet",
+//                 text: "•",
+//                 alignment: "left",
+//                 style: { paragraph: { indent: { left: 560, hanging: 280 } } }
+//               }
+//             ]
+//           }
+//         ]
+//       }
+//     }
+//   });
+
+//   return Packer.toBuffer(doc);
+// }
+
+// Requires: import { Document, Packer, Paragraph, TextRun } from "docx";
+
 function buildATSResumeDocxCompact(data) {
   const {
     fullName = "",
     email = "", phone = "", location = "", role = "",
     summary = "",
-    skills = [],                // array
-    areaOfExpertise = [],       // array
-    experience = [],            // [{company,title,start,end,bullets:[]}]
-    education = [],             // [{school,degree,start,end}]
-    links = []                  // [{label,url}]
-  } = data;
+    skills = [],                 // array of strings
+    experience = [],             // [{ company,title,start,end,bullets:[] }]
+    education = [],              // [{ school,degree,start,end }]
+    links = [],                  // [{ label, url }]
+    areaOfExpertise = []         // array of strings
+  } = data || {};
 
-  // ---- TUNING KNOBS (tight & one-page-ish) ----
-  const MAX_JOBS = 2;
-  const MAX_BULLETS_PER_JOB = 4;
-  const MAX_EDU = 2;
+  // Colors (hex without # for docx)
+  const INK = "0F172A";    // body text
+  const META = "475569";   // muted
+  const BRAND = "1D4ED8";  // section headings
 
-  const BLUE = "1D4ED8";     // accents (matches preview brand)
-  const INK  = "0F172A";     // main text
-  const META = "475569";     // light text
+  // Helpers
+  const text = (s) => new TextRun(String(s || ""));
+  const para = (txt, style="Body") => new Paragraph({ text: String(txt || ""), style });
+  const bullet = (txt) =>
+    new Paragraph({ style: "Bullet", bullet: { level: 0 }, children: [ text(txt) ] });
 
-  // helpers
-  const joinLine = (arr) => arr.filter(Boolean).join(" | ");
-  const line = (t, style, opts={}) => new Paragraph({ text: t || "", style, ...opts });
+  // Build sections without trailing blanks
+  const children = [];
 
-  // compact content (limit items so it fits)
-  const jobs = Array.isArray(experience) ? experience.slice(0, MAX_JOBS).map(j => ({
-    ...j, bullets: Array.isArray(j.bullets) ? j.bullets.slice(0, MAX_BULLETS_PER_JOB) : []
-  })) : [];
+  // Header
+  if (fullName) children.push(new Paragraph({ text: fullName.trim(), style: "Name" }));
 
-  const edus = Array.isArray(education) ? education.slice(0, MAX_EDU) : [];
+  const metaLine = [email, phone, location].filter(Boolean).join(" | ");
+  if (metaLine) children.push(new Paragraph({ text: metaLine, style: "Meta" }));
 
-  // turn list-y sections into single lines (saves space, still ATS-safe)
-  const skillLine = (skills || []).filter(Boolean).join(", ");
-  const expertiseLine = (areaOfExpertise || []).filter(Boolean).join(", ");
-  const linksLine = (links || [])
-    .filter(l => l && l.url)
-    .map(l => (l.label ? `${l.label}: ${l.url}` : l.url))
-    .join(" | ");
+  if (Array.isArray(links) && links.length) {
+    const linkLine = links
+      .filter(l => l && (l.url || l.label))
+      .map(l => `${l.label || ""}${l.label && l.url ? ": " : ""}${l.url || ""}`)
+      .join(" | ");
+    if (linkLine) children.push(new Paragraph({ text: linkLine, style: "Meta" }));
+  }
+
+  if (role) children.push(new Paragraph({ text: role, style: "Role" }));
+
+  // Section: Summary
+  if (summary) {
+    children.push(para("Summary", "Section"));
+    children.push(para(summary, "BodyTight"));
+  }
+
+  // Section: Area of Expertise (bulleted, compact)
+  if (Array.isArray(areaOfExpertise) && areaOfExpertise.length) {
+    children.push(para("Area of Expertise", "Section"));
+    areaOfExpertise.forEach(item => children.push(bullet(item)));
+  }
+
+  // Section: Skills (single compact line to conserve space)
+  if (Array.isArray(skills) && skills.length) {
+    children.push(para("Skills", "Section"));
+    children.push(para(skills.join(", "), "BodyTight"));
+  }
+
+  // Section: Experience
+  if (Array.isArray(experience) && experience.length) {
+    children.push(para("Experience", "Section"));
+
+    experience.forEach((job, idx) => {
+      const head = [job.title, job.company].filter(Boolean).join(" — ");
+      const dates = [job.start, job.end].filter(Boolean).join(" – ");
+
+      if (head) children.push(para(head, "JobHeading"));
+      if (dates) children.push(para(dates, "Meta"));
+
+      if (Array.isArray(job.bullets)) {
+        job.bullets.forEach(b => children.push(bullet(b)));
+      }
+
+      // spacer between jobs, but NOT after the last job
+      if (idx < experience.length - 1) {
+        children.push(new Paragraph({ text: "", style: "SpacerThin" }));
+      }
+    });
+  }
+
+  // Section: Education
+  if (Array.isArray(education) && education.length) {
+    children.push(para("Education", "Section"));
+
+    education.forEach((ed, idx) => {
+      const head = [ed.degree, ed.school].filter(Boolean).join(" — ");
+      const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
+
+      if (head) children.push(para(head, "JobHeading"));
+      if (dates) children.push(para(dates, "Meta"));
+
+      if (idx < education.length - 1) {
+        children.push(new Paragraph({ text: "", style: "SpacerThin" }));
+      }
+    });
+  }
+
+  // Trim trailing empty paragraphs (prevents bottom gap)
+  while (children.length > 0) {
+    const last = children[children.length - 1];
+    const isEmpty =
+      last.options?.text === "" ||
+      (Array.isArray(last.options?.children) && last.options.children.length === 0);
+    if (isEmpty) children.pop();
+    else break;
+  }
 
   const doc = new Document({
-    sections: [{
-      properties: {
-        // A4 page, tight margins
-        page: {
-          size: { width: 11906, height: 16838 }, // A4 twips
-          margin: { top: 720, right: 720, bottom: 720, left: 720 }, // 0.5"
-        },
-      },
-      children: [
-        line(fullName, "Name", { keepLines: true }),
-        line(joinLine([email, phone, location]), "Meta"),
-        linksLine ? line(linksLine, "Meta") : line("", "Meta"),
-        role ? line(role, "Role") : null,
-
-        ...(summary
-          ? [line("Summary", "Section"), line(summary, "BodyTight")]
-          : []),
-
-        ...(expertiseLine
-          ? [line("Area of Expertise", "Section"), line(expertiseLine, "BodyTight")]
-          : []),
-
-        ...(skillLine
-          ? [line("Skills", "Section"), line(skillLine, "BodyTight")]
-          : []),
-
-        ...(jobs.length
-          ? [
-              line("Experience", "Section"),
-              ...jobs.flatMap(j => {
-                const header = [j.title, j.company].filter(Boolean).join(" — ");
-                const dates  = [j.start, j.end].filter(Boolean).join(" – ");
-                const out = [];
-                if (header) out.push(line(header, "JobHeading", { keepLines: true }));
-                if (dates)  out.push(line(dates,  "Meta"));
-                (j.bullets || []).forEach(b => {
-                  out.push(new Paragraph({
-                    style: "Bullet",
-                    children: [new TextRun({ text: b })],
-                    numbering: { reference: "bul", level: 0 },
-                    keepLines: true
-                  }));
-                });
-                return out;
-              })
-            ]
-          : []),
-
-        ...(edus.length
-          ? [
-              line("Education", "Section"),
-              ...edus.flatMap(ed => {
-                const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
-                const dates  = [ed.start, ed.end].filter(Boolean).join(" – ");
-                const out = [];
-                if (header) out.push(line(header, "JobHeading", { keepLines: true }));
-                if (dates)  out.push(line(dates,  "Meta"));
-                return out;
-              })
-            ]
-          : []),
-      ].filter(Boolean),
-    }],
     styles: {
       paragraphStyles: [
         {
+          id: "Body",
+          name: "Body",
+          basedOn: "Normal",
+          run: { font: "Calibri", size: 22, color: INK },            // 11pt
+          paragraph: { spacing: { line: 276, after: 80 } }            // 1.15, 4pt after
+        },
+        {
           id: "BodyTight",
           name: "BodyTight",
-          basedOn: "Normal",
-          run: { font: "Calibri", color: INK, size: 21 }, // 10.5pt
-          paragraph: { spacing: { line: 260, after: 60 } } // ~1.15, 3pt after
+          basedOn: "Body",
+          run: { size: 22 },
+          paragraph: { spacing: { line: 276, after: 40 } }            // tighter
         },
         {
           id: "Name",
           name: "Name",
-          basedOn: "Normal",
-          run: { font: "Calibri", color: INK, bold: true, size: 34 }, // ~17pt
+          basedOn: "Body",
+          run: { size: 36, bold: true, color: INK },                  // 18pt
           paragraph: { spacing: { after: 120 } }
-        },
-        {
-          id: "Role",
-          name: "Role",
-          basedOn: "Normal",
-          run: { font: "Calibri", color: INK, bold: true, size: 24 },  // 12pt
-          paragraph: { spacing: { after: 80 } }
         },
         {
           id: "Meta",
           name: "Meta",
-          basedOn: "Normal",
-          run: { font: "Calibri", color: META, size: 18 }, // 9pt
+          basedOn: "Body",
+          run: { color: META, size: 20 },                             // 10pt
           paragraph: { spacing: { after: 60 } }
+        },
+        {
+          id: "Role",
+          name: "Role",
+          basedOn: "Body",
+          run: { size: 24, bold: true, color: INK },                  // 12pt
+          paragraph: { spacing: { after: 120 } }
         },
         {
           id: "Section",
           name: "Section",
-          basedOn: "Normal",
-          run: { font: "Calibri", color: BLUE, bold: true, size: 22 }, // 11pt
-          paragraph: { spacing: { before: 160, after: 60 } }
+          basedOn: "Body",
+          run: { bold: true, color: BRAND, size: 26 },                // ~13pt
+          paragraph: { spacing: { before: 200, after: 60 } }          // clear divider, compact after
         },
         {
           id: "JobHeading",
           name: "JobHeading",
-          basedOn: "Normal",
-          run: { font: "Calibri", color: INK, bold: true, size: 22 }, // 11pt
-          paragraph: { spacing: { after: 40 } }
+          basedOn: "Body",
+          run: { bold: true, color: INK, size: 24 },                  // 12pt
+          paragraph: { spacing: { after: 20 } }
         },
         {
           id: "Bullet",
           name: "Bullet",
-          basedOn: "Normal",
-          run: { font: "Calibri", color: INK, size: 21 },
-          paragraph: { spacing: { line: 260, after: 40 } } // tighter bullets
+          basedOn: "Body",
+          run: { size: 22, color: INK },
+          paragraph: { spacing: { line: 276, after: 40 } }            // comfy, but tight
         },
-      ],
-      numbering: {
-        config: [
-          {
-            reference: "bul",
-            levels: [
-              {
-                level: 0,
-                format: "bullet",
-                text: "•",
-                alignment: "left",
-                style: { paragraph: { indent: { left: 560, hanging: 280 } } }
-              }
-            ]
-          }
-        ]
-      }
-    }
+        {
+          id: "SpacerThin",
+          name: "SpacerThin",
+          basedOn: "Body",
+          run: { size: 1, color: INK },
+          paragraph: { spacing: { after: 40 } }
+        }
+      ]
+    },
+    sections: [{
+      properties: {
+        page: {
+          // 720 twips = 0.5", 360 = 0.25". Smaller bottom margin reduces visible gap.
+          margin: { top: 720, right: 720, bottom: 360, left: 720 }
+        }
+      },
+      children
+    }]
   });
 
   return Packer.toBuffer(doc);
 }
+
 
 
 function buildATSResumeDocx(data) {
