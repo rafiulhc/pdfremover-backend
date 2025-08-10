@@ -122,6 +122,113 @@ function buildResumeHTML({ fullName, email, phone, location, role, summary, skil
 }
 
 
+// function buildATSResumeDocx(data) {
+//   const {
+//     fullName = "",
+//     email = "",
+//     phone = "",
+//     location = "",
+//     role = "",
+//     summary = "",
+//     skills = [],
+//     experience = [],
+//     education = [],
+//   } = data;
+
+//   const doc = new Document({
+//     styles: {
+//       paragraphStyles: [
+//         {
+//           id: "NormalPara",
+//           name: "Normal",
+//           basedOn: "Normal",
+//           run: { font: "Calibri", size: 22 },
+//           paragraph: { spacing: { line: 276, after: 120 } },
+//         },
+//         {
+//           id: "TitleName",
+//           name: "TitleName",
+//           run: { font: "Calibri", size: 32, bold: true },
+//           paragraph: { spacing: { after: 200 } },
+//         },
+//         {
+//           id: "SectionHeading",
+//           name: "SectionHeading",
+//           run: { font: "Calibri", size: 24, bold: true },
+//           paragraph: { spacing: { before: 200, after: 100 } },
+//         },
+//         {
+//           id: "JobHeading",
+//           name: "JobHeading",
+//           run: { font: "Calibri", size: 22, bold: true },
+//           paragraph: { spacing: { after: 40 } },
+//         },
+//         {
+//           id: "Meta",
+//           name: "Meta",
+//           run: { color: "666666", size: 20 },
+//           paragraph: { spacing: { after: 80 } },
+//         },
+//       ],
+//     },
+//     sections: [{
+//       properties: {
+//         page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } },
+//       },
+//       children: [
+//         new Paragraph({ text: fullName, style: "TitleName" }),
+//         new Paragraph({
+//           text: [email, phone, location].filter(Boolean).join(" | "),
+//           style: "Meta",
+//         }),
+//         role ? new Paragraph({ text: role, style: "NormalPara" }) : new Paragraph({ text: "" }),
+
+//         ...(summary ? [
+//           new Paragraph({ text: "Summary", style: "SectionHeading" }),
+//           new Paragraph({ text: summary, style: "NormalPara" }),
+//         ] : []),
+
+//         ...(skills?.length ? [
+//           new Paragraph({ text: "Skills", style: "SectionHeading" }),
+//           ...skills.map(s => new Paragraph({ text: s, bullet: { level: 0 } })),
+//         ] : []),
+
+//         ...(experience?.length ? [
+//           new Paragraph({ text: "Experience", style: "SectionHeading" }),
+//           ...experience.flatMap(job => {
+//             const header = [job.title, job.company].filter(Boolean).join(" — ");
+//             const dates = [job.start, job.end].filter(Boolean).join(" – ");
+//             return [
+//               new Paragraph({ text: header, style: "JobHeading" }),
+//               dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
+//               ...(Array.isArray(job.bullets) ? job.bullets.map(b =>
+//                 new Paragraph({ text: b, bullet: { level: 0 } })
+//               ) : []),
+//               new Paragraph({ text: "" }),
+//             ].filter(Boolean);
+//           }),
+//         ] : []),
+
+//         ...(education?.length ? [
+//           new Paragraph({ text: "Education", style: "SectionHeading" }),
+//           ...education.flatMap(ed => {
+//             const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
+//             const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
+//             return [
+//               new Paragraph({ text: header, style: "JobHeading" }),
+//               dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
+//               new Paragraph({ text: "" }),
+//             ].filter(Boolean);
+//           }),
+//         ] : []),
+//       ],
+//     }],
+//   });
+
+//   return Packer.toBuffer(doc);
+// }
+
+// server: replace your buildATSResumeDocx with this one
 function buildATSResumeDocx(data) {
   const {
     fullName = "",
@@ -131,102 +238,164 @@ function buildATSResumeDocx(data) {
     role = "",
     summary = "",
     skills = [],
-    experience = [],
-    education = [],
+    experience = [],  // [{company,title,start,end,bullets:[]}]
+    education = [],   // [{school,degree,start,end}]
   } = data;
 
+  // Subtle modern blue that prints well and is still ATS-friendly
+  const ACCENT = "2563EB"; // #2563EB
+
+  // tiny helper to draw a thin rule (looks like a section divider)
+  const sectionRule = () =>
+    new Paragraph({
+      border: {
+        bottom: { color: ACCENT, space: 1, value: "single", size: 6 }, // ~0.5pt
+      },
+      spacing: { before: 60, after: 120 },
+    });
+
   const doc = new Document({
+    // Normalized styles (Calibri/Arial fallbacks, 10.5–12pt range)
     styles: {
-      paragraphStyles: [
-        {
-          id: "NormalPara",
-          name: "Normal",
-          basedOn: "Normal",
-          run: { font: "Calibri", size: 22 },
-          paragraph: { spacing: { line: 276, after: 120 } },
+      default: {
+        document: {
+          run: { font: "Calibri", size: 22 }, // 11pt
+          paragraph: { spacing: { line: 276, before: 0, after: 80 } }, // 1.15, 4pt after
         },
+      },
+      paragraphStyles: [
         {
           id: "TitleName",
           name: "TitleName",
-          run: { font: "Calibri", size: 32, bold: true },
-          paragraph: { spacing: { after: 200 } },
+          basedOn: "Normal",
+          run: { size: 32, bold: true }, // 16pt
+          paragraph: { spacing: { after: 80 } },
         },
         {
-          id: "SectionHeading",
-          name: "SectionHeading",
-          run: { font: "Calibri", size: 24, bold: true },
-          paragraph: { spacing: { before: 200, after: 100 } },
-        },
-        {
-          id: "JobHeading",
-          name: "JobHeading",
-          run: { font: "Calibri", size: 22, bold: true },
-          paragraph: { spacing: { after: 40 } },
+          id: "Tagline",
+          name: "Tagline",
+          basedOn: "Normal",
+          run: { color: "374151", size: 22 }, // 11pt, muted slate
+          paragraph: { spacing: { after: 160 } },
         },
         {
           id: "Meta",
           name: "Meta",
-          run: { color: "666666", size: 20 },
-          paragraph: { spacing: { after: 80 } },
+          basedOn: "Normal",
+          run: { color: "6B7280", size: 20 }, // 10pt
+          paragraph: { spacing: { after: 60 } },
+        },
+        {
+          id: "Heading",
+          name: "Heading",
+          basedOn: "Normal",
+          run: { bold: true, size: 24 }, // 12pt
+          paragraph: {
+            spacing: { before: 220, after: 80 },
+          },
+        },
+        {
+          id: "JobHeading",
+          name: "JobHeading",
+          basedOn: "Normal",
+          run: { bold: true, size: 22 }, // 11pt
+          paragraph: { spacing: { before: 60, after: 20 } },
+        },
+        {
+          id: "Bullet",
+          name: "Bullet",
+          basedOn: "Normal",
+          paragraph: {
+            indent: { left: 360, hanging: 240 }, // 0.5" left, 0.33" hanging
+            spacing: { before: 0, after: 40 },
+          },
         },
       ],
     },
-    sections: [{
-      properties: {
-        page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } },
+
+    sections: [
+      {
+        properties: {
+          page: {
+            // comfortable but compact margins
+            margin: { top: 800, right: 900, bottom: 800, left: 900 }, // ~0.56"/0.63"
+          },
+        },
+        children: [
+          // NAME
+          new Paragraph({ text: fullName, style: "TitleName" }),
+
+          // CONTACT LINE
+          new Paragraph({
+            text: [email, phone, location].filter(Boolean).join(" | "),
+            style: "Meta",
+          }),
+
+          // ROLE / TAGLINE
+          role ? new Paragraph({ text: role, style: "Tagline" }) : new Paragraph({ text: "" }),
+
+          // SUMMARY
+          ...(summary
+            ? [
+                sectionRule(),
+                new Paragraph({ text: "Summary", style: "Heading" }),
+                new Paragraph({ text: summary }),
+              ]
+            : []),
+
+          // SKILLS (single-line bullets to stay ATS-safe)
+          ...(skills?.length
+            ? [
+                sectionRule(),
+                new Paragraph({ text: "Skills", style: "Heading" }),
+                ...skills.map((s) => new Paragraph({ text: s, bullet: { level: 0 }, style: "Bullet" })),
+              ]
+            : []),
+
+          // EXPERIENCE
+          ...(experience?.length
+            ? [
+                sectionRule(),
+                new Paragraph({ text: "Experience", style: "Heading" }),
+                ...experience.flatMap((job) => {
+                  const header = [job.title, job.company].filter(Boolean).join(" — ");
+                  const dates = [job.start, job.end].filter(Boolean).join(" – ");
+                  return [
+                    new Paragraph({ text: header, style: "JobHeading" }),
+                    dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
+                    ...(Array.isArray(job.bullets)
+                      ? job.bullets.map((b) =>
+                          new Paragraph({ text: b, bullet: { level: 0 }, style: "Bullet" })
+                        )
+                      : []),
+                  ].filter(Boolean);
+                }),
+              ]
+            : []),
+
+          // EDUCATION
+          ...(education?.length
+            ? [
+                sectionRule(),
+                new Paragraph({ text: "Education", style: "Heading" }),
+                ...education.flatMap((ed) => {
+                  const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
+                  const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
+                  return [
+                    new Paragraph({ text: header, style: "JobHeading" }),
+                    dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
+                  ].filter(Boolean);
+                }),
+              ]
+            : []),
+        ],
       },
-      children: [
-        new Paragraph({ text: fullName, style: "TitleName" }),
-        new Paragraph({
-          text: [email, phone, location].filter(Boolean).join(" | "),
-          style: "Meta",
-        }),
-        role ? new Paragraph({ text: role, style: "NormalPara" }) : new Paragraph({ text: "" }),
-
-        ...(summary ? [
-          new Paragraph({ text: "Summary", style: "SectionHeading" }),
-          new Paragraph({ text: summary, style: "NormalPara" }),
-        ] : []),
-
-        ...(skills?.length ? [
-          new Paragraph({ text: "Skills", style: "SectionHeading" }),
-          ...skills.map(s => new Paragraph({ text: s, bullet: { level: 0 } })),
-        ] : []),
-
-        ...(experience?.length ? [
-          new Paragraph({ text: "Experience", style: "SectionHeading" }),
-          ...experience.flatMap(job => {
-            const header = [job.title, job.company].filter(Boolean).join(" — ");
-            const dates = [job.start, job.end].filter(Boolean).join(" – ");
-            return [
-              new Paragraph({ text: header, style: "JobHeading" }),
-              dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
-              ...(Array.isArray(job.bullets) ? job.bullets.map(b =>
-                new Paragraph({ text: b, bullet: { level: 0 } })
-              ) : []),
-              new Paragraph({ text: "" }),
-            ].filter(Boolean);
-          }),
-        ] : []),
-
-        ...(education?.length ? [
-          new Paragraph({ text: "Education", style: "SectionHeading" }),
-          ...education.flatMap(ed => {
-            const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
-            const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
-            return [
-              new Paragraph({ text: header, style: "JobHeading" }),
-              dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
-              new Paragraph({ text: "" }),
-            ].filter(Boolean);
-          }),
-        ] : []),
-      ],
-    }],
+    ],
   });
 
   return Packer.toBuffer(doc);
 }
+
 
 
 async function reconcileGumroadPaymentForResume(ticket) {
