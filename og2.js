@@ -131,94 +131,56 @@ function buildATSResumeDocx(data) {
     role = "",
     summary = "",
     skills = [],
-    experience = [],
-    education = [],
+    experience = [], // [{company, title, start, end, bullets:[]}]
+    education = [],  // [{school, degree, start, end}]
   } = data;
 
   const doc = new Document({
-    styles: {
-      paragraphStyles: [
-        {
-          id: "NormalPara",
-          name: "Normal",
-          basedOn: "Normal",
-          run: { font: "Calibri", size: 22 },
-          paragraph: { spacing: { line: 276, after: 120 } },
-        },
-        {
-          id: "TitleName",
-          name: "TitleName",
-          run: { font: "Calibri", size: 32, bold: true },
-          paragraph: { spacing: { after: 200 } },
-        },
-        {
-          id: "SectionHeading",
-          name: "SectionHeading",
-          run: { font: "Calibri", size: 24, bold: true },
-          paragraph: { spacing: { before: 200, after: 100 } },
-        },
-        {
-          id: "JobHeading",
-          name: "JobHeading",
-          run: { font: "Calibri", size: 22, bold: true },
-          paragraph: { spacing: { after: 40 } },
-        },
-        {
-          id: "Meta",
-          name: "Meta",
-          run: { color: "666666", size: 20 },
-          paragraph: { spacing: { after: 80 } },
-        },
-      ],
-    },
     sections: [{
-      properties: {
-        page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } },
-      },
+      properties: {},
       children: [
-        new Paragraph({ text: fullName, style: "TitleName" }),
-        new Paragraph({
-          text: [email, phone, location].filter(Boolean).join(" | "),
-          style: "Meta",
-        }),
-        role ? new Paragraph({ text: role, style: "NormalPara" }) : new Paragraph({ text: "" }),
+        new Paragraph({ text: fullName, heading: HeadingLevel.TITLE }),
+        new Paragraph({ text: [email, phone, location].filter(Boolean).join(" | ") }),
+        role ? new Paragraph({ text: role, spacing: { after: 160 } }) : new Paragraph({ text: "" }),
 
         ...(summary ? [
-          new Paragraph({ text: "Summary", style: "SectionHeading" }),
-          new Paragraph({ text: summary, style: "NormalPara" }),
+          new Paragraph({ text: "Summary", heading: HeadingLevel.HEADING_1 }),
+          new Paragraph({ text: summary, spacing: { after: 160 } }),
         ] : []),
 
         ...(skills?.length ? [
-          new Paragraph({ text: "Skills", style: "SectionHeading" }),
-          ...skills.map(s => new Paragraph({ text: s, bullet: { level: 0 } })),
+          new Paragraph({ text: "Skills", heading: HeadingLevel.HEADING_1 }),
+          new Paragraph({ text: skills.join(", "), spacing: { after: 160 } }),
         ] : []),
 
         ...(experience?.length ? [
-          new Paragraph({ text: "Experience", style: "SectionHeading" }),
-          ...experience.flatMap(job => {
+          new Paragraph({ text: "Experience", heading: HeadingLevel.HEADING_1 }),
+          ...experience.flatMap((job) => {
+            const lines = [];
             const header = [job.title, job.company].filter(Boolean).join(" — ");
             const dates = [job.start, job.end].filter(Boolean).join(" – ");
-            return [
-              new Paragraph({ text: header, style: "JobHeading" }),
-              dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
-              ...(Array.isArray(job.bullets) ? job.bullets.map(b =>
-                new Paragraph({ text: b, bullet: { level: 0 } })
-              ) : []),
-              new Paragraph({ text: "" }),
-            ].filter(Boolean);
+            lines.push(new Paragraph({ text: header, heading: HeadingLevel.HEADING_2 }));
+            if (dates) lines.push(new Paragraph({ text: dates }));
+            (job.bullets || []).forEach(b => {
+              lines.push(new Paragraph({
+                children: [new TextRun({ text: "• " + b })],
+              }));
+            });
+            lines.push(new Paragraph({ text: "", spacing: { after: 120 } }));
+            return lines;
           }),
         ] : []),
 
         ...(education?.length ? [
-          new Paragraph({ text: "Education", style: "SectionHeading" }),
-          ...education.flatMap(ed => {
+          new Paragraph({ text: "Education", heading: HeadingLevel.HEADING_1 }),
+          ...education.flatMap((ed) => {
             const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
             const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
             return [
-              new Paragraph({ text: header, style: "JobHeading" }),
-              dates ? new Paragraph({ text: dates, style: "Meta" }) : null,
-              new Paragraph({ text: "" }),
-            ].filter(Boolean);
+              new Paragraph({ text: header, heading: HeadingLevel.HEADING_2 }),
+              dates ? new Paragraph({ text: dates }) : new Paragraph({ text: "" }),
+              new Paragraph({ text: "", spacing: { after: 120 } }),
+            ];
           }),
         ] : []),
       ],
@@ -227,7 +189,6 @@ function buildATSResumeDocx(data) {
 
   return Packer.toBuffer(doc);
 }
-
 
 async function reconcileGumroadPaymentForResume(ticket) {
   try {
@@ -1150,29 +1111,6 @@ app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
   }
 });
 
-// npm i puppeteer
-app.get("/api/ai/resume/download-pdf", async (req, res) => {
-  const ticket = String(req.query.ticket || "");
-  const rec = resumeTickets.get(ticket);
-  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
-  if (!rec.paid) return res.status(402).json({ error: "Payment required" });
-
-  // use stored preview JSON -> rebuild the same HTML
-  let json = rec.inputs.previewJson || {};
-  if (typeof json === "string") try { json = JSON.parse(json); } catch {}
-  const html = buildResumeHTML({ ...rec.inputs, ...json });
-
-  const puppeteer = await import("puppeteer");
-  const browser = await puppeteer.launch({ args: ["--no-sandbox"] });
-  const page = await browser.newPage();
-  await page.setContent(html, { waitUntil: "networkidle0" });
-  const pdf = await page.pdf({ format: "A4", printBackground: true });
-  await browser.close();
-
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", 'attachment; filename="resume.pdf"');
-  res.send(pdf);
-});
 
 
 // ---------- start ----------
