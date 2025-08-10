@@ -1403,6 +1403,61 @@ app.get("/api/ai/resume/download-pdf", async (req, res) => {
   res.send(pdf);
 });
 
+// PDF-only download (after payment)
+app.get("/api/ai/resume/download-pdf", async (req, res) => {
+  try {
+    const ticket = String(req.query.ticket || "");
+    const rec = resumeTickets.get(ticket);
+    if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+    if (!rec.paid) return res.status(402).json({ error: "Payment required" });
+    if (!openai) return res.status(500).json({ error: "AI not configured" });
+
+    // Prefer the preview JSON so the PDF matches what user saw
+    let json = rec?.inputs?.previewJson;
+    if (!json) {
+      const prompt = fullJsonPrompt(rec.inputs || {});
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+        max_tokens: 900,
+        response_format: { type: "json_object" }
+      });
+      json = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
+    }
+
+    const skills = Array.isArray(json.skills) ? json.skills : [];
+    const experience = Array.isArray(json.experience) ? json.experience : [];
+    const education = Array.isArray(json.education) ? json.education : [];
+    const links = Array.isArray(json.links) ? json.links : [];
+    const areaOfExpertise = Array.isArray(json.areaOfExpertise) ? json.areaOfExpertise : [];
+
+    const html = buildResumeHTML({
+      fullName: rec.inputs.fullName,
+      email: rec.inputs.email,
+      phone: rec.inputs.phone,
+      location: rec.inputs.location,
+      role: rec.inputs.role,
+      summary: json.summary || "",
+      skills,
+      experience,
+      education,
+      links,
+      areaOfExpertise,
+    });
+
+    const pdfBuf = await htmlToPdfBuffer(html);
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="resume.pdf"');
+    return res.send(pdfBuf);
+  } catch (e) {
+    console.error("resume download-pdf error:", e);
+    return res.status(500).json({ error: "Failed to generate PDF" });
+  }
+});
+
+
 
 // ---------- start ----------
 const PORT = process.env.PORT || 4000;
