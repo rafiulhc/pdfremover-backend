@@ -293,6 +293,31 @@ setInterval(() => {
 const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "nktxk";
 const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "ubtedo";
 
+// Put this near your other requires/helpers (fs is already required above)
+function resolveChromiumPath() {
+  // 1) if you set it via env (Dockerfile sets PUPPETEER_EXECUTABLE_PATH)
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+
+  // 2) otherwise try common system locations (Debian/Heroku)
+  const candidates = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ];
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch {}
+  }
+  return null; // let puppeteer-core decide if it can
+}
+
+const exePath = resolveChromiumPath();
+const browser = await puppeteer.launch({
+  executablePath: exePath || undefined,
+  args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+  headless: "new",
+});
+
 
 // ---------- basics ----------
 app.use(cors({
