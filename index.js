@@ -223,64 +223,7 @@ function buildATSResumeDocxCompact(data) {
   return Packer.toBuffer(doc);
 }
 
-function buildATSResumeDocx(data) {
-  const {
-    fullName = "", email = "", phone = "", location = "", role = "",
-    summary = "", skills = [], experience = [], education = [], links = [], areaOfExpertise = []
-  } = data;
 
-  const doc = new Document({
-    styles: {
-      paragraphStyles: [
-        { id: "NormalPara", name: "NormalPara", basedOn: "Normal",
-          run: { font: "Calibri", size: 22, color: "0F172A" }, paragraph: { spacing: { line: 276, after: 120 } } },
-        { id: "TitleName", name: "TitleName",
-          run: { font: "Calibri", size: 36, bold: true, color: "0B1220" }, paragraph: { spacing: { after: 200 } } },
-        { id: "Meta", name: "Meta", run: { color: "475569", size: 20 }, paragraph: { spacing: { after: 80 } } },
-        { id: "SectionHeading", name: "SectionHeading",
-          run: { size: 24, bold: true, color: "1D4ED8" }, paragraph: { spacing: { before: 200, after: 100 } } },
-        { id: "JobHeading", name: "JobHeading", run: { size: 22, bold: true, color: "0B1220" }, paragraph: { spacing: { after: 40 } } },
-      ],
-    },
-    sections: [{
-      properties: { page: { margin: { top: 720, right: 720, bottom: 720, left: 720 } } },
-      children: [
-        new Paragraph({ text: fullName, style: "TitleName" }),
-        new Paragraph({ text: [email, phone, location].filter(Boolean).join(" | "), style: "Meta" }),
-        links && links.length ? new Paragraph({ text: links.filter(l=>l&&l.url).map(l => `${l.label || ""}: ${l.url}`).join(" | "), style: "Meta" }) : new Paragraph({ text: "" }),
-        role ? new Paragraph({ text: role, style: "NormalPara" }) : new Paragraph({ text: "" }),
-        ...(summary ? [new Paragraph({ text: "Summary", style: "SectionHeading" }), new Paragraph({ text: summary, style: "NormalPara" })] : []),
-        ...(areaOfExpertise?.length ? [new Paragraph({ text: "Area of Expertise", style: "SectionHeading" }), ...areaOfExpertise.map(s => new Paragraph({ style: "NormalPara", children: [new TextRun({ text: "• " + s })] }))] : []),
-        ...(skills?.length ? [new Paragraph({ text: "Skills", style: "SectionHeading" }), ...skills.map(s => new Paragraph({ style: "NormalPara", children: [new TextRun({ text: "• " + s })] }))] : []),
-        ...(experience?.length ? [new Paragraph({ text: "Experience", style: "SectionHeading" }),
-          ...experience.flatMap(job => {
-            const header = [job.title, job.company].filter(Boolean).join(" — ");
-            const dates = [job.start, job.end].filter(Boolean).join(" – ");
-            const lines = [];
-            lines.push(new Paragraph({ text: header, style: "JobHeading" }));
-            if (dates) lines.push(new Paragraph({ text: dates, style: "Meta" }));
-            (job.bullets || []).forEach(b => lines.push(new Paragraph({ style: "NormalPara", children: [new TextRun({ text: "• " + b })] })));
-            lines.push(new Paragraph({ text: "" }));
-            return lines;
-          }),
-        ] : []),
-        ...(education?.length ? [new Paragraph({ text: "Education", style: "SectionHeading" }),
-          ...education.flatMap(ed => {
-            const header = [ed.degree, ed.school].filter(Boolean).join(" — ");
-            const dates = [ed.start, ed.end].filter(Boolean).join(" – ");
-            const lines = [];
-            lines.push(new Paragraph({ text: header, style: "JobHeading" }));
-            if (dates) lines.push(new Paragraph({ text: dates, style: "Meta" }));
-            lines.push(new Paragraph({ text: "" }));
-            return lines;
-          }),
-        ] : []),
-      ],
-    }],
-  });
-
-  return Packer.toBuffer(doc);
-}
 
 // ==== Tickets (in-memory; unchanged) ====
 const resumeTickets = new Map();
@@ -292,31 +235,6 @@ setInterval(() => {
 
 const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "nktxk";
 const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "ubtedo";
-
-// Put this near your other requires/helpers (fs is already required above)
-function resolveChromiumPath() {
-  // 1) if you set it via env (Dockerfile sets PUPPETEER_EXECUTABLE_PATH)
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
-
-  // 2) otherwise try common system locations (Debian/Heroku)
-  const candidates = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-  ];
-  for (const p of candidates) {
-    try { if (fs.existsSync(p)) return p; } catch {}
-  }
-  return null; // let puppeteer-core decide if it can
-}
-
-const exePath = resolveChromiumPath();
-const browser = await puppeteer.launch({
-  executablePath: exePath || undefined,
-  args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-  headless: "new",
-});
 
 
 // ---------- basics ----------
@@ -1207,6 +1125,36 @@ app.post("/api/gumroad/ping", (req, res) => {
   }
 });
 
+// ---- puppeteer helpers (place once, above your routes) ----
+function resolveChromiumPath() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+  const candidates = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ];
+  for (const p of candidates) { try { if (fs.existsSync(p)) return p; } catch {} }
+  return null;
+}
+
+let _browserPromise = null;
+async function getBrowser() {
+  if (!_browserPromise) {
+    const exePath = resolveChromiumPath();
+    _browserPromise = puppeteer.launch({
+      executablePath: exePath || undefined,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+      headless: "new",
+    });
+    const close = async () => { try { (await _browserPromise)?.close(); } catch {} };
+    process.once("exit", close);
+    process.once("SIGINT", () => { close().finally(() => process.exit(0)); });
+    process.once("SIGTERM", () => { close().finally(() => process.exit(0)); });
+  }
+  return _browserPromise;
+}
+
 // === FREE: exact-preview PDF (HTML → PDF via headless Chrome) ===
 app.post("/api/ai/resume/pdf", express.json({ limit: "1mb" }), async (req, res) => {
   try {
@@ -1214,7 +1162,6 @@ app.post("/api/ai/resume/pdf", express.json({ limit: "1mb" }), async (req, res) 
 
     // If caller didn't send html, rebuild it so we still work:
     if (!html) {
-      // If no previewJson, try to generate (keeps behavior compatible)
       if (!previewJson) {
         if (!openai) return res.status(500).json({ error: "AI not configured" });
         const prompt = fullJsonPrompt(inputs || {});
@@ -1239,8 +1186,8 @@ app.post("/api/ai/resume/pdf", express.json({ limit: "1mb" }), async (req, res) 
       if (!Array.isArray(previewJson.links) || previewJson.links.length === 0) {
         previewJson.links = [
           inputs.linkedin && { label: "LinkedIn", url: inputs.linkedin },
-          inputs.github && { label: "GitHub", url: inputs.github },
-          inputs.portfolio && { label: "Portfolio", url: inputs.portfolio },
+          inputs.github &&   { label: "GitHub", url: inputs.github },
+          inputs.portfolio &&{ label: "Portfolio", url: inputs.portfolio },
         ].filter(Boolean);
       }
 
@@ -1259,21 +1206,14 @@ app.post("/api/ai/resume/pdf", express.json({ limit: "1mb" }), async (req, res) 
       });
     }
 
-    // Launch Chromium (Heroku/docker: use system binary + no-sandbox)
-    const exePath = resolveChromiumPath();
-    const browser = await puppeteer.launch({
-      executablePath: exePath || undefined,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      headless: "new",
-    });
-
+    // Use shared Chromium (no leaks, faster subsequent calls)
+    const browser = await getBrowser();
     const page = await browser.newPage();
 
-    // Ensure fonts/backgrounds render as seen
     await page.emulateMediaType("screen");
     await page.setContent(html, { waitUntil: "networkidle0" });
 
-    // PDF of the full preview page, including background + shadow (exact look)
+    // Exact A4 PDF with backgrounds (matches preview)
     const pdfBuf = await page.pdf({
       format: "A4",
       printBackground: true,
@@ -1281,7 +1221,7 @@ app.post("/api/ai/resume/pdf", express.json({ limit: "1mb" }), async (req, res) 
       margin: { top: "0.4in", right: "0.4in", bottom: "0.4in", left: "0.4in" },
     });
 
-    await browser.close();
+    await page.close();
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="resume.pdf"');
@@ -1291,6 +1231,7 @@ app.post("/api/ai/resume/pdf", express.json({ limit: "1mb" }), async (req, res) 
     return res.status(500).json({ error: "Failed to render PDF" });
   }
 });
+
 
 
 // ---------- start ----------
