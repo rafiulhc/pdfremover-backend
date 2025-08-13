@@ -5,13 +5,19 @@ FROM node:20-bookworm-slim
 WORKDIR /app
 RUN useradd -m app && chown -R app:app /app
 
-# OS deps: LibreOffice (headless), Ghostscript, Poppler, fonts, tini
+# OS deps:
+# - LibreOffice/GS/Poppler for your other tools
+# - chromium for puppeteer-core (system browser)
+# - fonts for nicer resume rendering
+# - tini as PID 1 (we'll use -s to enable subreaper)
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libreoffice \
       libreoffice-writer \
       ghostscript \
       poppler-utils \
+      chromium \
       fonts-dejavu-core \
+      fonts-liberation \
       ca-certificates \
       curl \
       tini \
@@ -20,6 +26,13 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 # Ensure fast temp disk path exists and is writable
 ENV TMPDIR=/tmp
 RUN mkdir -p /tmp && chown -R app:app /tmp
+
+# Make sure Chromium is discoverable by puppeteer-core
+# (your code also resolves common paths, but this makes it explicit)
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+# Set HOME so LibreOffice has a place for its profile
+ENV HOME=/home/app
 
 # Copy only package files first (cache layer)
 COPY package*.json ./
@@ -36,18 +49,12 @@ ENV PORT=4000
 # Useful defaults for stability on small dynos
 ENV WEB_CONCURRENCY=2
 ENV NODE_OPTIONS="--max-old-space-size=512"
-# Set HOME so LibreOffice has a place for its profile
-ENV HOME=/home/app
 
 # Drop root
 USER app
 
-# Use tini as PID 1 to reap child processes and forward signals to group (-g)
-ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
-
-# (Optional but nice) Healthcheck hitting your /health route if you added it
-# HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
-#   CMD wget -qO- "http://127.0.0.1:${PORT}/health" || exit 1
+# Use tini as PID 1; add -s to act as subreaper (fixes your warning) and -g to forward to process group
+ENTRYPOINT ["/usr/bin/tini", "-s", "-g", "--"]
 
 # Start the server (no shell so signals propagate cleanly)
 CMD ["node", "index.js"]
