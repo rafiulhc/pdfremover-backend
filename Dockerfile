@@ -36,9 +36,18 @@ ENV PORT=4000
 # Useful defaults for stability on small dynos
 ENV WEB_CONCURRENCY=2
 ENV NODE_OPTIONS="--max-old-space-size=512"
+# Set HOME so LibreOffice has a place for its profile
+ENV HOME=/home/app
 
-# Use tini as PID 1 to reap child processes
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# Drop root
+USER app
+
+# Use tini as PID 1 to reap child processes and forward signals to group (-g)
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+
+# (Optional but nice) Healthcheck hitting your /health route if you added it
+# HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+#   CMD wget -qO- "http://127.0.0.1:${PORT}/health" || exit 1
 
 # Start the server (no shell so signals propagate cleanly)
 CMD ["node", "index.js"]
