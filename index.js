@@ -1118,53 +1118,138 @@ function runGhostscript(inputPath, outputPath, opts = {}) {
 }
 
 /** compress image */
+/** compress image (png supports lossless first, optional lossy fallback when no alpha) */
 app.post("/api/compress/image", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
   const targetKb = Math.max(50, parseInt(req.body.targetKb || "500", 10));
-  let format = String((req.body.format || "webp")).toLowerCase();
-  if (format === "jpg") format = "jpeg";
-  if (!["webp", "jpeg", "png"].includes(format)) format = "webp";
+  const allowLossyIfNoAlpha = String(req.body.allowLossyIfNoAlpha || "false").toLowerCase() === "true";
+  let requestedFormat = String((req.body.format || "webp")).toLowerCase();
+  if (requestedFormat === "jpg") requestedFormat = "jpeg";
+  if (!["webp", "jpeg", "png"].includes(requestedFormat)) requestedFormat = "webp";
+  let lossyFallback = String((req.body.lossyFallback || "webp")).toLowerCase();
+  if (lossyFallback === "jpg") lossyFallback = "jpeg";
+  if (!["webp", "jpeg"].includes(lossyFallback)) lossyFallback = "webp";
 
   const inPath = req.file.path;
+
   try {
     const input = fs.readFileSync(inPath);
     const meta = await sharp(input).metadata();
+    const hasAlpha = !!meta.hasAlpha;
     let width = meta.width || 2000;
 
-    let quality = 82;
+    // global knobs
+    sharp.cache({ files: 0, items: 0, memory: 64 });
+    sharp.concurrency(2);
+
+    // attempt counters
+    const MAX_ATTEMPTS = 10;
+    const MAX_LOSSY_ATTEMPTS = 6;
+
+    // state
     let attempt = 0;
     let outBuf = null;
+    let lastLen = Infinity;
+    let finalFormat = requestedFormat;
 
-    while (attempt < 10) {
-      const candidateWidth =
-        attempt < 4 ? width : Math.max(600, Math.floor(width * Math.pow(0.85, attempt - 3)));
+    // per-format knobs
+    let quality = 82;            // for webp/jpeg
+    let compressionLevel = 6;    // for png (0..9)
+    let colors = 256;            // for png palette mode
 
-      let pipeline = sharp(input).resize(candidateWidth, null, { fit: "inside", withoutEnlargement: true });
+    async function encodeOnce(fmt, candidateWidth) {
+      let pipeline = sharp(input).resize(candidateWidth, null, {
+        fit: "inside",
+        withoutEnlargement: true,
+      });
 
-      if (format === "webp") {
+      if (fmt === "webp") {
         pipeline = pipeline.webp({ quality, effort: 4 });
-      } else if (format === "jpeg") {
-        pipeline = pipeline.flatten({ background: "#ffffff" }).jpeg({ quality, mozjpeg: true });
-      } else if (format === "png") {
-        pipeline = pipeline.png({ compressionLevel: 9, palette: true });
+      } else if (fmt === "jpeg") {
+        pipeline = (hasAlpha ? pipeline.flatten({ background: "#ffffff" }) : pipeline)
+          .jpeg({ quality, mozjpeg: true });
+      } else if (fmt === "png") {
+        const level = Math.min(9, compressionLevel);
+        pipeline = pipeline.png({
+          compressionLevel: level,
+          palette: true,
+          colors: Math.max(16, colors),
+        });
       }
 
-      outBuf = await pipeline.toBuffer();
+      return pipeline.toBuffer();
+    }
 
+    // 1) Try requested format (PNG lossless goes first if chosen)
+    while (attempt < MAX_ATTEMPTS) {
+      const shrinkPhase = Math.max(0, attempt - 3);
+      const candidateWidth = shrinkPhase === 0
+        ? width
+        : Math.max(600, Math.floor(width * Math.pow(0.85, shrinkPhase)));
+
+      outBuf = await encodeOnce(finalFormat, candidateWidth);
+
+      // success
       if (outBuf.length <= targetKb * 1024) break;
-      if (format === "webp" || "jpeg") {
+
+      // no progress -> stop current mode
+      if (outBuf.length >= lastLen) break;
+      lastLen = outBuf.length;
+
+      // tweak knobs for next round
+      if (finalFormat === "webp" || finalFormat === "jpeg") {
         quality = Math.max(45, quality - 8);
+      } else if (finalFormat === "png") {
+        colors = Math.max(16, Math.floor(colors / 2));       // 256→128→64→32→16
+        compressionLevel = Math.min(9, compressionLevel + 1); // 6→7→8→9
       }
+
       attempt++;
     }
 
+    // 2) If PNG couldn’t meet target, no alpha, and fallback allowed → switch to lossy
+    if (
+      finalFormat === "png" &&
+      allowLossyIfNoAlpha &&
+      !hasAlpha &&
+      outBuf &&
+      outBuf.length > targetKb * 1024
+    ) {
+      finalFormat = lossyFallback;   // "webp" (default) or "jpeg"
+      // reset lossy knobs and progress tracking
+      quality = 82;
+      lastLen = Infinity;
+
+      let lossyAttempt = 0;
+      while (lossyAttempt < MAX_LOSSY_ATTEMPTS) {
+        const shrinkPhase = Math.max(0, lossyAttempt - 2);
+        const candidateWidth = shrinkPhase === 0
+          ? width
+          : Math.max(600, Math.floor(width * Math.pow(0.85, shrinkPhase)));
+
+        const buf = await encodeOnce(finalFormat, candidateWidth);
+
+        if (buf.length <= targetKb * 1024) { outBuf = buf; break; }
+        if (buf.length >= lastLen) { outBuf = buf; break; }
+        lastLen = buf.length;
+
+        // step lossy quality
+        quality = Math.max(45, quality - 8);
+        lossyAttempt++;
+        outBuf = buf;
+      }
+    }
+
+    // fallback safety
+    if (!outBuf) outBuf = input;
+
     const ct =
-      format === "webp" ? "image/webp" :
-      format === "jpeg" ? "image/jpeg" : "image/png";
+      finalFormat === "webp" ? "image/webp" :
+      finalFormat === "jpeg" ? "image/jpeg" : "image/png";
     const ext =
-      format === "webp" ? "webp" :
-      format === "jpeg" ? "jpg" : "png";
+      finalFormat === "webp" ? "webp" :
+      finalFormat === "jpeg" ? "jpg" : "png";
 
     res.setHeader("Content-Type", ct);
     res.setHeader("Content-Disposition", `attachment; filename="compressed.${ext}"`);
@@ -1176,6 +1261,7 @@ app.post("/api/compress/image", upload.single("file"), async (req, res) => {
     try { fs.unlinkSync(inPath); } catch {}
   }
 });
+
 
 /** compress pdf */
 app.post("/api/compress/pdf", upload.single("file"), async (req, res) => {
