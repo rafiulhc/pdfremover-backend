@@ -1057,6 +1057,27 @@ app.get("/api/pro/status", async (req, res) => {
 
   return res.status(200).json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
 });
+// Download if paid and ready (proxy stream from CloudConvert URL)
+app.get("/api/pro/download", async (req, res) => {
+  const ticket = String(req.query.ticket || "");
+  const rec = tickets.get(ticket);
+  if (!rec) return res.status(404).json({ error: "Invalid ticket" });
+  if (rec.error) return res.status(500).json({ error: rec.error });
+  if (!rec.paid) return res.status(402).json({ error: "Payment required" });
+  if (!rec.ready || !rec.file?.url) return res.status(425).json({ error: "Conversion not ready yet" });
+
+  try {
+    const filename = (rec.file.filename || "converted.docx").replace(/[/\\]/g, "_");
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    const stream = await axios.get(rec.file.url, { responseType: "stream" });
+    stream.data.pipe(res);
+  } catch (e) {
+    console.error("download error:", e);
+    res.status(500).json({ error: "Failed to fetch file" });
+  }
+});
 
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 
