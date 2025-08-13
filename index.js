@@ -138,6 +138,160 @@ function buildResumeHTML({
 </div></body></html>`;
 }
 
+// ---------- Quality helpers (drop-in) ----------
+function dedupe(arr = []) {
+  const seen = new Set();
+  return arr.filter(x => {
+    const k = String(x || "").trim().toLowerCase();
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function trimWords(s = "", max = 22) {
+  const parts = String(s).split(/\s+/);
+  if (parts.length <= max) return s;
+  return parts.slice(0, max).join(" ") + "…";
+}
+
+function softCapBullets(experience = []) {
+  if (!Array.isArray(experience)) return [];
+  return experience.map((job, i) => {
+    const maxBullets = i === 0 ? 6 : 5;        // latest role 6, earlier 5
+    const bullets = Array.isArray(job?.bullets) ? job.bullets.slice(0, maxBullets).map(b => trimWords(b, 22)) : [];
+    return { ...job, bullets };
+  });
+}
+
+// Map role keywords → priority skills (broad & tech-agnostic enough to handle many job types)
+const ROLE_PRIORITIES = [
+  { key: /front[\s-]?end|react|vue|angular/i, skills: ["JavaScript", "TypeScript", "React", "Next.js", "Redux", "CSS", "HTML", "Webpack", "Node.js"] },
+  { key: /back[\s-]?end|api|server|node|spring|django|rails/i, skills: ["Node.js", "Express", "REST", "GraphQL", "PostgreSQL", "MySQL", "MongoDB", "Java", "Spring", "Python", "Django"] },
+  { key: /data (engineer|platform)|etl|warehouse|dbt|airflow|spark/i, skills: ["Python", "SQL", "Airflow", "Spark", "DBT", "Snowflake", "Redshift", "Kafka", "Docker", "Kubernetes"] },
+  { key: /data (scientist|science)|ml|ai|model/i, skills: ["Python", "Pandas", "NumPy", "Scikit-learn", "PyTorch", "TensorFlow", "SQL", "Experimentation", "A/B Testing"] },
+  { key: /ml|ai|llm|foundation model/i, skills: ["Python", "PyTorch", "Transformers", "LangChain", "LLMs", "Vector Databases", "Prompt Engineering", "RAG", "MLOps"] },
+  { key: /devops|sre|site reliability|platform/i, skills: ["Linux", "AWS", "GCP", "Azure", "Terraform", "Kubernetes", "Docker", "CI/CD", "Prometheus", "Grafana"] },
+  { key: /mobile|ios|android|flutter|react native/i, skills: ["Swift", "Kotlin", "Android", "iOS", "React Native", "Flutter", "Xcode", "Play Store", "Fastlane"] },
+  { key: /security|secops|appsec|infosec/i, skills: ["Threat Modeling", "OWASP Top 10", "SIEM", "IAM", "TLS", "Network Security", "Vulnerability Management"] },
+  { key: /product manager|pm|product management/i, skills: ["Product Strategy", "Roadmapping", "User Research", "A/B Testing", "Analytics", "OKRs", "Stakeholder Management"] },
+  { key: /designer|ux|ui|product design/i, skills: ["Figma", "Prototyping", "User Research", "Interaction Design", "Design Systems", "Usability Testing"] },
+  { key: /qa|quality|test/i, skills: ["Test Automation", "Selenium", "Cypress", "Playwright", "Unit Testing", "Integration Testing", "Jest", "CI/CD"] }
+];
+
+function canonicalizeSkill(s = "") {
+  const norm = s.trim()
+    .replace(/^javascript$/i, "JavaScript")
+    .replace(/^typescript$/i, "TypeScript")
+    .replace(/^node(js)?$/i, "Node.js")
+    .replace(/^postgres(ql)?$/i, "PostgreSQL")
+    .replace(/^mongo(db)?$/i, "MongoDB")
+    .replace(/^aws$/i, "AWS")
+    .replace(/^gcp$/i, "GCP")
+    .replace(/^llms?$/i, "LLMs");
+  return norm || s.trim();
+}
+
+function normalizeSkills(skills = []) {
+  return dedupe(skills.map(canonicalizeSkill)).slice(0, 24); // hard cap to keep ATS readable
+}
+
+function scoreByPriority(targetRole = "", skill = "") {
+  if (!targetRole || !skill) return 0;
+  for (let i = 0; i < ROLE_PRIORITIES.length; i++) {
+    const bucket = ROLE_PRIORITIES[i];
+    if (bucket.key.test(targetRole)) {
+      // higher score if skill is explicitly in the bucket; also give small score for partial matches
+      if (bucket.skills.includes(skill)) return 1000 - i; // descending priority by index
+      if (skill.toLowerCase().includes(targetRole.toLowerCase().split(" ")[0])) return 500 - i;
+    }
+  }
+  return 0;
+}
+
+function rerankSkillsByRole(targetRole = "", skills = []) {
+  const norm = normalizeSkills(skills);
+  // score: priority weight + frequency fallback
+  const counts = norm.reduce((m, s) => (m[s] = (m[s] || 0) + 1, m), {});
+  return [...norm].sort((a, b) => {
+    const pa = scoreByPriority(targetRole, a) + counts[a] * 0.01;
+    const pb = scoreByPriority(targetRole, b) + counts[b] * 0.01;
+    return pb - pa;
+  });
+}
+
+async function ensureBulletsForMostRecent(json, inputs, openai) {
+  try {
+    const ok = Array.isArray(json?.experience) &&
+               json.experience.length &&
+               Array.isArray(json.experience[0]?.bullets) &&
+               json.experience[0].bullets.length >= 4;
+    if (ok) return json; // already good
+
+    if (!openai) return json; // can't second-pass without AI
+
+    // Re-ask with the same rich prompt + one extra constraint
+    const augmented = fullJsonPrompt({
+      ...inputs,
+      // small hint that we want stronger recent-role bullets
+      _extraConstraint: "Ensure 4–6 quantified bullets for the most recent role."
+    }) + `\n\nAdditional constraint: Ensure 4–6 quantified bullets for the most recent role.\n`;
+
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: augmented }],
+      temperature: 0.2,
+      max_tokens: 900,
+      response_format: { type: "json_object" }
+    });
+
+    const second = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
+
+    // Merge strategy: if second has >=4 bullets for job 0, take those bullets only; else keep original.
+    if (Array.isArray(second?.experience) &&
+        second.experience.length &&
+        Array.isArray(second.experience[0]?.bullets) &&
+        second.experience[0].bullets.length >= 4) {
+      json.experience = json.experience || [];
+      json.experience[0] = {
+        ...(json.experience[0] || {}),
+        bullets: second.experience[0].bullets
+      };
+    }
+    return json;
+  } catch {
+    return json;
+  }
+}
+
+function postProcessResumeJson(json, targetRole = "") {
+  const safe = { ...(json || {}) };
+
+  // Skills: normalize, rerank by role, and keep balanced size (10–18 typical)
+  safe.skills = rerankSkillsByRole(targetRole, Array.isArray(safe.skills) ? safe.skills : []);
+  if (safe.skills.length > 18) safe.skills = safe.skills.slice(0, 18);
+  if (safe.skills.length < 10) safe.skills = dedupe(safe.skills); // leave as-is if low
+
+  // Experience: soft cap bullets and trim long lines
+  safe.experience = softCapBullets(Array.isArray(safe.experience) ? safe.experience : []);
+
+  // Area of Expertise: dedupe + compact (4–8)
+  if (!Array.isArray(safe.areaOfExpertise)) safe.areaOfExpertise = [];
+  safe.areaOfExpertise = dedupe(safe.areaOfExpertise).slice(0, 8);
+
+  // Links: keep the 3 labels and ensure shape
+  const labels = new Set(["LinkedIn", "GitHub", "Portfolio"]);
+  safe.links = (Array.isArray(safe.links) ? safe.links : [])
+    .filter(x => x && typeof x === "object" && labels.has(String(x.label)))
+    .map(x => ({ label: x.label, url: String(x.url || "") }));
+
+  // Summary: keep under ~60 words (safety trim)
+  if (typeof safe.summary === "string") safe.summary = trimWords(safe.summary, 60);
+
+  return safe;
+}
+
+
 function buildATSResumeDocxCompact(data) {
   const {
     fullName = "", email = "", phone = "", location = "", role = "",
@@ -394,32 +548,37 @@ Rules:
 }
 function fullJsonPrompt(inputs) {
   const {
-    fullName="", email="", phone="", location="", role="", yearsExp="",
-    skills="", achievements="", experienceText="", educationText="",
-    linkedin="", github="", portfolio="", areaOfExpertise=""
+    fullName = "", email = "", phone = "", location = "",
+    role = "", yearsExp = "",
+    skills = "", achievements = "", experienceText = "", educationText = "",
+    linkedin = "", github = "", portfolio = "",
+    areaOfExpertise = ""
   } = inputs;
 
-  return `You are an expert resume writer. Produce a clean JSON (and ONLY JSON) for an ATS-friendly resume.
+  return `
+You are a senior technical recruiter AND professional resume writer with deep ATS knowledge.
+Your task: transform the raw inputs into a concise, high-impact, ATS-optimized resume **JSON**.
 
-Candidate:
+# Candidate (verbatim user data)
 - Name: ${fullName}
 - Email: ${email}
 - Phone: ${phone}
 - Location: ${location}
 - Target role: ${role}
-- Years experience: ${yearsExp}
-- Key skills (comma-separated): ${skills}
+- Years of experience: ${yearsExp}
+- Skills (comma-separated): ${skills}
 - Area of expertise (comma-separated): ${areaOfExpertise}
 - Achievements (raw text): ${achievements}
 - Experience (raw text): ${experienceText}
 - Education (raw text): ${educationText}
 - Links: LinkedIn ${linkedin} | GitHub ${github} | Portfolio ${portfolio}
 
-Return strictly this JSON schema:
+# Output FORMAT (STRICT)
+Return **ONLY** a single JSON object with exactly these keys (arrays may be empty but must exist):
 {
-  "summary": "1 short paragraph",
-  "areaOfExpertise": ["Theme A", "Theme B"],
-  "skills": ["Skill A", "Skill B"],
+  "summary": "1 short paragraph (max ~60 words)",
+  "areaOfExpertise": ["Theme A", "Theme B", "..."],
+  "skills": ["Skill A", "Skill B", "..."],
   "experience": [
     { "company": "", "title": "", "start": "", "end": "", "bullets": ["...", "..."] }
   ],
@@ -433,12 +592,75 @@ Return strictly this JSON schema:
   ]
 }
 
-Rules:
-- Keep it factual and ATS-friendly. No tables.
-- Convert raw text into clean bullets with strong action verbs and numbers where implied.
-- If dates are unknown, leave empty strings.
-- Only output JSON.`;
+# Global RULES (apply to all sections)
+- **Truthful only**: never invent employers, titles, dates, degrees, or metrics. If unknown, use "" or skip the item.
+- **ATS-safe**: no tables, emoji, fancy symbols; plain text only.
+- **Role targeting**: prioritize content aligned with "${role}".
+- **Dates**: format as "MMM YYYY" (e.g., "Jan 2022"). If unknown, use "" (empty string).
+- **Numbers**: prefer actual numbers from input; if implied ranges exist, use "≈" (e.g., "reduced cost by ≈15%") only when clearly supported by the raw text.
+- **Voice/Tense**: use present tense for current role, past tense for past roles. No first-person pronouns.
+- **Length discipline**:
+  - summary ≤ ~60 words
+  - 4–6 bullets for the most recent role; 3–5 for earlier roles
+  - each bullet ≤ ~22 words
+- **Keyword hygiene**: include hard skills relevant to the target role; dedupe; use common ATS tokens (e.g., "JavaScript" not "JS" unless both are valuable).
+- **Consistency**: company/title capitalization; American English spelling; consistent punctuation.
+- **Links**: include URLs only if provided and look valid (http/https). Otherwise set url to "".
+- **No filler**: avoid clichés ("hard-working," "team player"), unless explicitly in the user text.
+
+# Section-Specific RULES
+
+## summary
+- 1 short paragraph that positions the candidate for "${role}".
+- Front-load impact (scope, seniority, core stack, best proof point).
+- Include 1–2 most important keywords for ATS matching.
+
+## areaOfExpertise
+- 4–8 concise themes (e.g., "Backend Architecture", "Generative AI", "Growth Analytics").
+- Derived from skills + experienceText; no fluff.
+
+## skills
+- Normalize & dedupe; group only as flat array of strings (no categories).
+- Prefer canonical names (e.g., "Node.js", "React", "PostgreSQL", "AWS", "Kubernetes").
+- Keep 10–18 items, sorted: core stack first, then complementary tools.
+
+## experience
+- Parse roles chronologically (most recent first). If multiple employers are unclear, infer separate entries only when text clearly separates them.
+- "start"/"end" use "MMM YYYY" or "".
+- Bullets follow **Impact-first STAR** style: **Result → how → scale**.
+  Examples patterns:
+  - "Increased X by Y% by doing Z at scale N."
+  - "Reduced cost/time by X via Y, impacting N users/markets."
+  - "Delivered feature X (A/B tested), improving metric Y (p-value if stated)."
+- Use concrete nouns, action verbs (Led, Built, Architected, Automated, Optimized, Scaled, Refactored, Deployed).
+- If the raw text mixes responsibilities and achievements, prioritize **quantified achievements**. Responsibilities only if needed for context.
+
+## education
+- Include degrees and schools that appear in the input. If missing dates, leave "".
+- Certifications may be omitted unless clearly present in educationText.
+
+## links
+- Preserve the three labels exactly: "LinkedIn", "GitHub", "Portfolio".
+- Use the provided values if they look like URLs; else set "".
+
+# Data Cleaning / Normalization
+- Trim whitespace; remove duplicates.
+- Standardize tech names (e.g., "Javascript" → "JavaScript", "Postgres" → "PostgreSQL").
+- For overlapping items (e.g., "LLMs", "Large Language Models"), prefer the more ATS-friendly variant or keep both if valuable.
+
+# Examples of bullet rewriting (style guide)
+- Weak: "Worked on API performance."
+- Strong: "Cut P95 API latency from 820ms → 240ms by adding Redis caching and query plans; improved checkout CVR by 3.1%."
+
+- Weak: "Responsible for data pipelines."
+- Strong: "Built CDC pipelines in Airflow/Spark, reducing daily ETL runtime 47% and saving ≈$1.2k/month in compute."
+
+# IMPORTANT
+- If any field is unknown, **use an empty string** (""), not "N/A".
+- Output **ONLY** the JSON object with the exact keys shown above—no commentary, no markdown, no code fences.
+`;
 }
+
 
 // ---------- RESUME (same endpoints/behavior) ----------
 app.post("/api/ai/resume/prepare", express.json(), async (req, res) => {
@@ -500,7 +722,10 @@ app.get("/api/ai/resume/download", async (req, res) => {
     if (!rec.paid) return res.status(402).json({ error: "Payment required" });
     if (!openai) return res.status(500).json({ error: "AI not configured" });
 
+    // Prefer using preview JSON if present
     let json = rec?.inputs?.previewJson;
+
+    // Fallback: generate fresh JSON
     if (!json) {
       const prompt = fullJsonPrompt(rec.inputs || {});
       const resp = await openai.chat.completions.create({
@@ -512,6 +737,28 @@ app.get("/api/ai/resume/download", async (req, res) => {
       });
       json = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
     }
+
+    // Backfill basics
+    if (!Array.isArray(json.skills)) {
+      json.skills = String(rec.inputs.skills || "").split(",").map(s=>s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(json.areaOfExpertise) || json.areaOfExpertise.length === 0) {
+      json.areaOfExpertise = String(rec.inputs.areaOfExpertise || "")
+        .split(",").map(s=>s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(json.links) || json.links.length === 0) {
+      json.links = [
+        rec.inputs.linkedin && { label: "LinkedIn", url: rec.inputs.linkedin },
+        rec.inputs.github && { label: "GitHub", url: rec.inputs.github },
+        rec.inputs.portfolio && { label: "Portfolio", url: rec.inputs.portfolio },
+      ].filter(Boolean);
+    }
+
+    // ⬇️ New: ensure 4–6 bullets for most recent role if weak
+    json = await ensureBulletsForMostRecent(json, rec.inputs || {}, openai);
+
+    // ⬇️ New: rerank skills + soft caps
+    json = postProcessResumeJson(json, rec.inputs?.role || "");
 
     const buf = await buildATSResumeDocxCompact({
       fullName: rec.inputs.fullName,
@@ -540,6 +787,7 @@ app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
   try {
     if (!openai) return res.status(500).json({ error: "AI not configured" });
     const inputs = req.body || {};
+
     const prompt = fullJsonPrompt(inputs);
     const resp = await openai.chat.completions.create({
       model: "gpt-4o",
@@ -552,17 +800,27 @@ app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
     let json = {};
     try { json = JSON.parse(resp.choices?.[0]?.message?.content || "{}"); } catch {}
 
-    if (!Array.isArray(json.skills)) json.skills = String(inputs.skills || "").split(",").map(s=>s.trim()).filter(Boolean);
+    // Backfill fields if the model missed them
+    if (!Array.isArray(json.skills)) {
+      json.skills = String(inputs.skills || "").split(",").map(s=>s.trim()).filter(Boolean);
+    }
     if (!Array.isArray(json.areaOfExpertise) || json.areaOfExpertise.length === 0) {
-      json.areaOfExpertise = String(inputs.areaOfExpertise || "").split(",").map(s=>s.trim()).filter(Boolean);
+      json.areaOfExpertise = String(inputs.areaOfExpertise || "")
+        .split(",").map(s=>s.trim()).filter(Boolean);
     }
     if (!Array.isArray(json.links) || json.links.length === 0) {
       json.links = [
         inputs.linkedin && { label: "LinkedIn", url: inputs.linkedin },
-        inputs.github &&   { label: "GitHub", url: inputs.github },
-        inputs.portfolio &&{ label: "Portfolio", url: inputs.portfolio },
+        inputs.github && { label: "GitHub", url: inputs.github },
+        inputs.portfolio && { label: "Portfolio", url: inputs.portfolio },
       ].filter(Boolean);
     }
+
+    // ⬇️ New: ensure 4–6 bullets for the most recent role via second pass if needed
+    json = await ensureBulletsForMostRecent(json, inputs, openai);
+
+    // ⬇️ New: rerank skills by role, soft-cap bullets, tidy everything
+    json = postProcessResumeJson(json, inputs.role || "");
 
     const html = buildResumeHTML({
       fullName: inputs.fullName,
@@ -584,6 +842,7 @@ app.post("/api/ai/resume/preview", express.json(), async (req, res) => {
     return res.status(500).json({ error: "Failed to build preview" });
   }
 });
+
 
 // ---------- FREE TOOLS (unchanged routes; improved internals) ----------
 
