@@ -642,30 +642,32 @@ app.post("/api/merge-pdfs", upload.array("files"), async (req, res) => {
 });
 
 /** DOCX -> PDF */
-app.post("/api/convert/docx-to-pdf", upload.single("file"), limitHeavy(async (req, res) => {
+app.post("/api/convert/docx-to-pdf", upload.single("file"), async (req, res) => {
   const tmpPath = req.file?.path;
   if (!tmpPath) return res.status(400).json({ error: "No file uploaded" });
 
   const origName = req.file.originalname || "input.docx";
   const baseNoExt = path.parse(origName).name;
-  const jobDir = fs.mkdtempSync(path.join(BASE_TMP, "lo-"));
+  const outDir = OUTDIR;
 
   try {
     await runSoffice([
       "--headless","--nologo",
       "-env:UserInstallation=file:///tmp/lo_profile",
       "--convert-to","pdf",
-      "--outdir", jobDir,
+      "--outdir", outDir,
       tmpPath
     ]);
 
     const outFile =
-      findConverted(jobDir, baseNoExt, "pdf") ||
-      findConverted(jobDir, path.parse(tmpPath).name, "pdf");
+      findConverted(outDir, baseNoExt, "pdf") ||
+      findConverted(outDir, path.parse(tmpPath).name, "pdf");
 
     if (!outFile || !fs.existsSync(outFile)) throw new Error("Conversion output not found");
 
-    streamFile(res, outFile, "converted.pdf", "application/pdf");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="converted.pdf"');
+    res.send(fs.readFileSync(outFile));
   } catch (e) {
     console.error("docx->pdf error:", e.message);
     res.status(500).json({
@@ -675,9 +677,14 @@ app.post("/api/convert/docx-to-pdf", upload.single("file"), limitHeavy(async (re
     });
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
-    try { rmSync(jobDir, { recursive: true, force: true }); } catch {}
+    try {
+      const cleanup =
+        findConverted(outDir, baseNoExt, "pdf") ||
+        findConverted(outDir, path.parse(tmpPath).name, "pdf");
+      if (cleanup) fs.unlinkSync(cleanup);
+    } catch {}
   }
-}));
+});
 
 /** PDF -> DOCX (LibreOffice baseline, free) */
 app.post("/api/convert/pdf-to-docx", upload.single("file"), limitHeavy(async (req, res) => {
@@ -1231,8 +1238,6 @@ app.post("/api/ai/resume/pdf", express.json({ limit: "1mb" }), async (req, res) 
     return res.status(500).json({ error: "Failed to render PDF" });
   }
 });
-
-
 
 // ---------- start ----------
 const PORT = process.env.PORT || 4000;
