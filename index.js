@@ -292,8 +292,7 @@ setInterval(() => {
 
 const GUMROAD_RESUME_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK_RESUME || "nktxk";
 const GUMROAD_PRODUCT_PERMALINK = process.env.GUMROAD_PRODUCT_PERMALINK || "ubtedo";
-const GUMROAD_MIN_PRICE_CENTS = parseInt(process.env.GUMROAD_MIN_PRICE_CENTS || "199", 10);
-const GUMROAD_ACCESS_TOKEN = process.env.GUMROAD_ACCESS_TOKEN || "";
+
 
 // ---------- basics ----------
 app.use(cors({
@@ -378,21 +377,7 @@ function findConverted(outDir, baseNoExt, targetExt) {
   return path.join(outDir, newest);
 }
 
-// ---------- AI helpers ----------
-function previewPrompt(inputs) {
-  const { role = "", skills = "", experienceText = "" } = inputs;
-  return `You are a professional resume writer. Create a SHORT preview (5-7 bullet points) of an ATS-friendly resume for the following candidate.
 
-Role target: ${role}
-Key skills: ${skills}
-Experience summary (raw text): ${experienceText}
-
-Rules:
-- Output plain text bullets only.
-- No tables, no fancy formatting.
-- Focus on quantified, impact-oriented bullets.
-- Keep to 5-7 lines.`;
-}
 function fullJsonPrompt(inputs) {
   const {
     fullName = "", email = "", phone = "", location = "",
