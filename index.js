@@ -1314,6 +1314,105 @@ app.get("/api/pro/status", async (req, res) => {
   return res.status(200).json({ paid: rec.paid, ready: rec.ready, error: rec.error || null });
 });
 
+// === FREE: build PDF resume (no payment) ===
+// Accepts the same inputs as preview. If previewJson is passed, we use it.
+// Otherwise we generate JSON with fullJsonPrompt() via OpenAI (if configured).
+app.post("/api/ai/resume/pdf", express.json(), async (req, res) => {
+  try {
+    const inputs = req.body || {};
+
+    // 1) get JSON: prefer client-provided previewJson to avoid a second AI call
+    let json = inputs.previewJson;
+    if (!json) {
+      if (!openai) return res.status(500).json({ error: "AI not configured" });
+      const prompt = fullJsonPrompt(inputs);
+      const resp = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+        max_tokens: 900,
+        response_format: { type: "json_object" }
+      });
+      json = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
+    }
+
+    // Sanity fills (same as preview route)
+    if (!Array.isArray(json.skills)) {
+      json.skills = String(inputs.skills || "").split(",").map(s=>s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(json.areaOfExpertise) || json.areaOfExpertise.length === 0) {
+      json.areaOfExpertise = String(inputs.areaOfExpertise || "")
+        .split(",").map(s=>s.trim()).filter(Boolean);
+    }
+    if (!Array.isArray(json.links) || json.links.length === 0) {
+      json.links = [
+        inputs.linkedin && { label: "LinkedIn", url: inputs.linkedin },
+        inputs.github && { label: "GitHub", url: inputs.github },
+        inputs.portfolio && { label: "Portfolio", url: inputs.portfolio },
+      ].filter(Boolean);
+    }
+
+    // 2) build DOCX buffer (compact, ATS-safe)
+    const docxBuf = await buildATSResumeDocxCompact({
+      fullName: inputs.fullName,
+      email: inputs.email,
+      phone: inputs.phone,
+      location: inputs.location,
+      role: inputs.role,
+      summary: json.summary || "",
+      skills: Array.isArray(json.skills) ? json.skills : [],
+      experience: Array.isArray(json.experience) ? json.experience : [],
+      education: Array.isArray(json.education) ? json.education : [],
+      links: Array.isArray(json.links) ? json.links : [],
+      areaOfExpertise: Array.isArray(json.areaOfExpertise) ? json.areaOfExpertise : [],
+    });
+
+    // 3) convert DOCX -> PDF via LibreOffice (headless)
+    const tmpBase = `resume-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const tmpDocx = path.join(OUTDIR, `${tmpBase}.docx`);
+    const outPdfPath = path.join(OUTDIR, `${tmpBase}.pdf`);
+    fs.writeFileSync(tmpDocx, docxBuf);
+
+    try {
+      await runSoffice([
+        "--headless","--nologo",
+        "-env:UserInstallation=file:///tmp/lo_profile",
+        "--convert-to","pdf",
+        "--outdir", OUTDIR,
+        tmpDocx
+      ]);
+
+      if (!fs.existsSync(outPdfPath)) {
+        // Fallback: try locate by name (some LO builds change the name)
+        const alt = findConverted(OUTDIR, tmpBase, "pdf");
+        if (!alt || !fs.existsSync(alt)) throw new Error("PDF output not found");
+        // stream alt
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `attachment; filename="resume.pdf"`);
+        return res.send(fs.readFileSync(alt));
+      }
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="resume.pdf"`);
+      return res.send(fs.readFileSync(outPdfPath));
+    } catch (e) {
+      console.error("resume pdf conversion error:", e);
+      return res.status(500).json({
+        error: e.message.includes("soffice")
+          ? "Converter not available on server"
+          : "Failed to convert to PDF"
+      });
+    } finally {
+      try { fs.unlinkSync(tmpDocx); } catch {}
+      try { fs.unlinkSync(outPdfPath); } catch {}
+    }
+  } catch (e) {
+    console.error("resume pdf route error:", e);
+    return res.status(500).json({ error: "Failed to generate resume PDF" });
+  }
+});
+
+
 app.use("/api/gumroad/ping", express.urlencoded({ extended: true }));
 app.post("/api/gumroad/ping", (req, res) => {
   try {
