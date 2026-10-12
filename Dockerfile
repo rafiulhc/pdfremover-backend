@@ -1,5 +1,5 @@
 # ---- base runtime ----
-FROM node:20-bookworm-slim
+FROM node:24-bookworm-slim
 
 # Set working dir and non-root user
 WORKDIR /app
