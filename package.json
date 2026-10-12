@@ -1,34 +1,37 @@
 {
   "name": "pdfremover-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "PDF tools API (merge, split, compress, convert) behind pdfmergersplitter.app",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test",
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "lint": "eslint ."
   },
-  "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "archiver": "^7.0.1",
     "axios": "^1.11.0",
-    "bullmq": "^5.56.9",
-    "child_process": "^1.0.2",
     "cloudconvert": "^3.0.0",
     "cors": "^2.8.5",
     "docx": "^9.5.1",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
-    "form-data": "^4.0.4",
-    "heroku": "^10.12.0",
-    "ioredis": "^5.7.0",
     "multer": "^2.0.2",
-    "nanoid": "^5.1.5",
     "openai": "^5.12.2",
     "pdf-lib": "^1.17.1",
-
-    "puppeteer-core": "^24.16.1",
-    "sharp": "^0.34.3",
-    "uuid": "^11.1.0"
+    "puppeteer-core": "^25.12.0",
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0",
+    "supertest": "^7.3.0"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }

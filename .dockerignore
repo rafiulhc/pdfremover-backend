@@ -6,3 +6,5 @@ Dockerfile
 .gitignore
 uploads
 .env
+.env.*
+test
