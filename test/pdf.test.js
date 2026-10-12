@@ -10,6 +10,11 @@ test("GET /health is ok and not cached", async () => {
   assert.equal(res.headers["cache-control"], "no-store");
 });
 
+test("GET /api/health works too (the path CloudFront routes to the backend)", async () => {
+  const { app } = makeApp();
+  await request(app).get("/api/health").expect(200, { status: "ok" });
+});
+
 test("debug route that leaked server details is gone", async () => {
   const { app } = makeApp();
   await request(app).get("/api/debug/soffice").expect(404);

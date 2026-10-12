@@ -22,7 +22,7 @@ async function post(path, files, fields = {}) {
 }
 
 const checks = [
-  ["health", async () => (await fetch(`${base}/health`)).status === 200],
+  ["health", async () => (await fetch(`${base}/api/health`)).status === 200],
   ["docx-to-pdf", async () => {
     const docx = await Packer.toBuffer(new Document({ sections: [{ children: [new Paragraph("hello")] }] }));
     const r = await post("/api/convert/docx-to-pdf", [["file", docx, "hello.docx"]]);
