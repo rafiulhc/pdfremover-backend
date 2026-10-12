@@ -1,0 +1,162 @@
+# Every push and pull request: lint, unit tests, dependency audit, then build the production
+# image, scan it, and smoke-test the heavy routes inside it.
+# Pushes to main also deploy: push the image to ECR, roll it out on ECS (automatic rollback if it
+# fails health checks or returns 5xx), then smoke-test the live site through CloudFront.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: us-west-1
+  ECR_REPOSITORY: pdfremover-backend
+  ECS_CLUSTER: pdfremover
+  ECS_SERVICE: pdfremover-backend
+  TASK_FAMILY: pdfremover-backend
+  CONTAINER_NAME: backend
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  image:
+    needs: quality
+    # Native ARM64 runner: the image runs on Graviton (ARM64) Fargate, so we test what we ship.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # OIDC: exchange a GitHub token for short-lived AWS credentials (deploy only)
+    env:
+      IMAGE: pdfremover-backend:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci # smoke.js uses pdf-lib and docx to build its test files
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true # fail only on what an update can fix
+          exit-code: "1"
+
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name app -p 4000:4000 "$IMAGE"
+          for i in $(seq 1 30); do curl -sf localhost:4000/health >/dev/null && break; sleep 1; done
+          node scripts/smoke.js http://localhost:4000 || { docker logs app; exit 1; }
+          docker stop -t 30 app
+
+      # ---------- deploy (main only) ----------
+      - name: AWS credentials (OIDC)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd  # v2.1.7
+
+      - name: Push image (tag = commit SHA)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          remote="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker tag "$IMAGE" "$remote"
+          docker push "$remote"
+          echo "image=$remote" >> "$GITHUB_OUTPUT"
+
+      # Copy the latest task definition (settings come from Terraform) and swap only the image.
+      - name: Current task definition
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new task definition
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@138c24f321fdbdf7edee4a685519d253cae2cdea  # v1.9.0
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.push.outputs.image }}
+
+      - name: Deploy to ECS (waits until stable; ECS rolls back on failure)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@c465972ecbd160473f22e683363b422a5412a3de  # v2.6.3
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+
+      # After an automatic rollback the service is "stable" again on the OLD version, so the
+      # step above passes. Fail the run unless the new revision is the one serving traffic.
+      - name: Verify the new version is live (not rolled back)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          EXPECTED: ${{ steps.deploy.outputs.task-definition-arn }}
+        run: |
+          live=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].deployments[?status==`PRIMARY`].taskDefinition | [0]' --output text)
+          echo "expected: $EXPECTED"
+          echo "live:     $live"
+          if [ "$live" != "$EXPECTED" ]; then
+            echo "::error::Deployment was rolled back by ECS; production still runs the previous version"
+            exit 1
+          fi
+
+      - name: Smoke-test production
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: node scripts/smoke.js "$SITE_URL"
