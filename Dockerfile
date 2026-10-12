@@ -10,7 +10,9 @@ RUN useradd -m app && chown -R app:app /app
 # - chromium for puppeteer-core (system browser)
 # - fonts for nicer resume rendering
 # - tini as PID 1 (we'll use -s to enable subreaper)
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+# `upgrade` pulls Debian security fixes newer than the base image (CI's Trivy scan fails otherwise).
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libreoffice \
       libreoffice-writer \
       ghostscript \
@@ -37,8 +39,11 @@ ENV HOME=/home/app
 # Copy only package files first (cache layer)
 COPY package*.json ./
 
-# Install prod deps only
-RUN npm ci --omit=dev
+# Install prod deps only, then remove npm itself: the server runs with `node`, and the npm CLI
+# bundled in the base image carries its own dependencies (and their CVEs) into production.
+RUN npm ci --omit=dev \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+              /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 
 # Copy app (adjust if you have a build step)
 COPY . .
