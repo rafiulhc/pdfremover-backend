@@ -39,7 +39,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - run: npm test
+      - name: Unit tests
+        run: npm test
+        env:
+          # The runner's /usr/bin/chromium is a snap wrapper that never starts; use its Chrome
+          # so the SSRF test runs against a real browser.
+          PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
 
